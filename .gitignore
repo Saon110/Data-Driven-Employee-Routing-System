@@ -2,3 +2,7 @@
 .DS_Store
 backend/.venv/
 backend/__pycache__/
+backend/.env
+backend/app/core/__pycache__/
+backend/app/db/__pycache__/
+backend/app/schemas/__pycache__/
