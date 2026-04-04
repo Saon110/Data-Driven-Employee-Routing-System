@@ -1,2 +1,33 @@
 *.pdf
 .DS_Store
+
+# Node modules
+node_modules/
+
+# Build output
+dist/
+build/
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE/editor files
+.vscode/
+.idea/
+
+# Vite cache
+.vite/
+
+# TypeScript cache
+*.tsbuildinfo
