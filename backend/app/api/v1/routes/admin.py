@@ -725,8 +725,9 @@ def run_pickup_routing(
         source_summary["route_geometry"][route_source] += 1
         leg_durations_seconds = route_metrics.get("leg_durations_seconds", [])
         segment_minutes = [max(1, int(round(float(sec) / 60.0))) for sec in leg_durations_seconds]
+        expected_legs = len(ordered) + 1  # start->first stop, stops..., last stop->office
 
-        if len(segment_minutes) != len(ordered_node_sequence) - 1:
+        if len(segment_minutes) != expected_legs:
             raise HTTPException(
                 status_code=500,
                 detail=f"Unexpected route leg mismatch for vehicle {car.get('plate_no') or car.get('vehicle_id')}",
