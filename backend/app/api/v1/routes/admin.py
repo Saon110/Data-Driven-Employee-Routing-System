@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import math
 import logging
+import os
 from datetime import date, datetime, time, timedelta
 from time import perf_counter
 from typing import Any
 
 import networkx as nx
-import osmnx as ox
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
@@ -25,6 +25,7 @@ DHAKA_BBOX = {
 }
 
 _GRAPH_CACHE: Any = None
+DEFAULT_ROUTING_ENGINE = os.getenv("ROUTING_ENGINE", "lightweight").strip().lower()
 
 
 def _progress(message: str) -> None:
@@ -64,11 +65,24 @@ def _combine_dt(service_date: str, t: time) -> datetime:
     return datetime.combine(parsed_date, t)
 
 
+def _get_osmnx_module() -> Any:
+    try:
+        import osmnx as ox  # type: ignore
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail="OSMnx routing engine unavailable in this environment",
+        ) from exc
+    return ox
+
+
 def _get_graph() -> Any:
     global _GRAPH_CACHE
     if _GRAPH_CACHE is not None:
         _progress("Using cached OSMnx graph")
         return _GRAPH_CACHE
+
+    ox = _get_osmnx_module()
 
     ox.settings.use_cache = True
     ox.settings.log_console = False
@@ -95,14 +109,71 @@ def _get_graph() -> Any:
 
 
 def _nearest_node(graph: Any, lat: float, lng: float) -> int:
+    ox = _get_osmnx_module()
     try:
         node_id = ox.distance.nearest_nodes(graph, X=lng, Y=lat)
-    except ImportError as exc:
+    except Exception as exc:
         raise HTTPException(
             status_code=500,
-            detail="Routing dependency missing: install scikit-learn and restart backend",
+            detail="Failed to map coordinates to nearest road node",
         ) from exc
     return int(node_id)
+
+
+def _lightweight_travel_seconds(
+    lat1: float,
+    lng1: float,
+    lat2: float,
+    lng2: float,
+    average_speed_kmph: float,
+    road_factor: float = 1.3,
+) -> float:
+    effective_speed = max(10.0, float(average_speed_kmph))
+    distance_km = _haversine_km(lat1, lng1, lat2, lng2) * road_factor
+    return (distance_km / effective_speed) * 3600.0
+
+
+def _compute_lightweight_route_metrics(
+    points: list[dict[str, float]],
+    average_speed_kmph: float,
+) -> dict[str, Any]:
+    if len(points) < 2:
+        return {
+            "distance_km": 0.0,
+            "duration_seconds": 0.0,
+            "duration_min": 0.0,
+            "leg_durations_seconds": [],
+            "geometry": points,
+            "source": "lightweight",
+        }
+
+    leg_durations_seconds: list[float] = []
+    total_distance_km = 0.0
+    total_duration_s = 0.0
+
+    for i in range(len(points) - 1):
+        a = points[i]
+        b = points[i + 1]
+        distance_km = _haversine_km(a["lat"], a["lng"], b["lat"], b["lng"]) * 1.3
+        duration_s = _lightweight_travel_seconds(
+            a["lat"],
+            a["lng"],
+            b["lat"],
+            b["lng"],
+            average_speed_kmph,
+        )
+        total_distance_km += distance_km
+        total_duration_s += duration_s
+        leg_durations_seconds.append(duration_s)
+
+    return {
+        "distance_km": total_distance_km,
+        "duration_seconds": total_duration_s,
+        "duration_min": total_duration_s / 60.0,
+        "leg_durations_seconds": leg_durations_seconds,
+        "geometry": points,
+        "source": "lightweight",
+    }
 
 
 def _shortest_travel_seconds(graph: Any, source_node: int, target_node: int) -> float:
@@ -239,11 +310,14 @@ def run_pickup_routing(
     office_buffer_minutes = max(5, min(10, office_buffer_minutes))
     stop_dwell_minutes = int(payload.get("stop_dwell_minutes", 2))
     average_speed_kmph = float(payload.get("average_speed_kmph", 25.0))
+    routing_engine = str(payload.get("routing_engine") or DEFAULT_ROUTING_ENGINE).strip().lower()
+    if routing_engine not in {"lightweight", "osmnx"}:
+        routing_engine = "lightweight"
 
     logger.info("=" * 60)
     logger.info("STARTING PICKUP ROUTING")
     logger.info("service_date=%s shift_start_time=%s office=(%.6f, %.6f)", service_date, shift_start_time, office_lat, office_lng)
-    logger.info("params: office_buffer=%sm stop_dwell=%sm speed=%.2f km/h", office_buffer_minutes, stop_dwell_minutes, average_speed_kmph)
+    logger.info("params: office_buffer=%sm stop_dwell=%sm speed=%.2f km/h engine=%s", office_buffer_minutes, stop_dwell_minutes, average_speed_kmph, routing_engine)
     logger.info("=" * 60)
     _progress("Routing started")
 
@@ -457,33 +531,47 @@ def run_pickup_routing(
     )
     _progress(f"Candidates ready: valid={len(candidate_requests)} skipped={len(skipped_requests)}")
 
-    graph = _get_graph()
-    _progress("Mapping pickups and vehicles to nearest graph nodes")
-
-    for req in candidate_requests:
-        req["pickup_node_id"] = _nearest_node(graph, req["pickup_lat"], req["pickup_lng"])
-
-    for car in fleet:
-        ref_lat = float(car["parking_lat"]) if car["parking_lat"] is not None else office_lat
-        ref_lng = float(car["parking_lng"]) if car["parking_lng"] is not None else office_lng
-        car["parking_node_id"] = _nearest_node(graph, ref_lat, ref_lng)
-
-    office_node_id = _nearest_node(graph, office_lat, office_lng)
-
+    graph: Any | None = None
+    office_node_id: int | None = None
     pair_travel_cache: dict[tuple[int, int], float] = {}
 
-    def travel_seconds(source_node: int, target_node: int) -> float:
-        key = (source_node, target_node)
-        if key not in pair_travel_cache:
-            pair_travel_cache[key] = _shortest_travel_seconds(graph, source_node, target_node)
-        return pair_travel_cache[key]
+    if routing_engine == "osmnx":
+        graph = _get_graph()
+        _progress("Mapping pickups and vehicles to nearest graph nodes")
+
+        for req in candidate_requests:
+            req["pickup_node_id"] = _nearest_node(graph, req["pickup_lat"], req["pickup_lng"])
+
+        for car in fleet:
+            ref_lat = float(car["parking_lat"]) if car["parking_lat"] is not None else office_lat
+            ref_lng = float(car["parking_lng"]) if car["parking_lng"] is not None else office_lng
+            car["parking_ref_lat"] = ref_lat
+            car["parking_ref_lng"] = ref_lng
+            car["parking_node_id"] = _nearest_node(graph, ref_lat, ref_lng)
+
+        office_node_id = _nearest_node(graph, office_lat, office_lng)
+
+        def travel_seconds(source_node: int, target_node: int) -> float:
+            key = (source_node, target_node)
+            if key not in pair_travel_cache:
+                pair_travel_cache[key] = _shortest_travel_seconds(graph, source_node, target_node)
+            return pair_travel_cache[key]
+
+    else:
+        _progress("Using lightweight routing (haversine-based)")
+        for car in fleet:
+            ref_lat = float(car["parking_lat"]) if car["parking_lat"] is not None else office_lat
+            ref_lng = float(car["parking_lng"]) if car["parking_lng"] is not None else office_lng
+            car["parking_ref_lat"] = ref_lat
+            car["parking_ref_lng"] = ref_lng
 
     logger.info(
-        "assignment matrix prepared: pickups=%s cars=%s source=osmnx",
+        "assignment matrix prepared: pickups=%s cars=%s source=%s",
         len(candidate_requests),
         len(fleet),
+        routing_engine,
     )
-    _progress("Assignment matrix prepared from OSMnx travel times")
+    _progress(f"Assignment matrix prepared from {routing_engine} travel estimates")
 
     unassigned_requests = []
     logger.info("=" * 60)
@@ -500,7 +588,16 @@ def run_pickup_routing(
             if len(car["assigned_requests"]) >= car["capacity"]:
                 continue
 
-            req_to_car_seconds = travel_seconds(int(req["pickup_node_id"]), int(car["parking_node_id"]))
+            if routing_engine == "osmnx":
+                req_to_car_seconds = travel_seconds(int(req["pickup_node_id"]), int(car["parking_node_id"]))
+            else:
+                req_to_car_seconds = _lightweight_travel_seconds(
+                    req["pickup_lat"],
+                    req["pickup_lng"],
+                    float(car["parking_ref_lat"]),
+                    float(car["parking_ref_lng"]),
+                    average_speed_kmph,
+                )
             if req_to_car_seconds < best_travel_seconds:
                 best_travel_seconds = req_to_car_seconds
                 best_idx = idx
@@ -531,9 +628,9 @@ def run_pickup_routing(
     cars_output = []
     employee_assignments: dict[str, Any] = {}
     source_summary = {
-        "assignment_matrix_source": "osmnx",
-        "route_geometry": {"osmnx": 0, "unknown": 0},
-        "route_matrix": {"osmnx": 0, "unknown": 0},
+        "assignment_matrix_source": routing_engine,
+        "route_geometry": {"osmnx": 0, "lightweight": 0, "unknown": 0},
+        "route_matrix": {"osmnx": 0, "lightweight": 0, "unknown": 0},
     }
 
     logger.info("=" * 60)
@@ -556,26 +653,45 @@ def run_pickup_routing(
             f"Routing vehicle {car.get('plate_no') or car.get('vehicle_id')} with {len(assigned)} stops"
         )
 
-        route_matrix_source = "osmnx"
+        route_matrix_source = routing_engine
         source_summary["route_matrix"][route_matrix_source] += 1
 
-        remaining_indices = list(range(len(assigned)))
-        current_node_id = int(car["parking_node_id"])
         ordered = []
+        remaining_indices = list(range(len(assigned)))
 
-        while remaining_indices:
-            nearest_local_idx = min(remaining_indices, key=lambda local_idx: travel_seconds(current_node_id, int(assigned[local_idx]["pickup_node_id"])))
-            nearest_distance = travel_seconds(current_node_id, int(assigned[nearest_local_idx]["pickup_node_id"]))
-            if not math.isfinite(nearest_distance):
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"No drivable path found while building route for vehicle {car.get('plate_no') or car.get('vehicle_id')}",
+        if routing_engine == "osmnx":
+            current_node_id = int(car["parking_node_id"])
+            while remaining_indices:
+                nearest_local_idx = min(remaining_indices, key=lambda local_idx: travel_seconds(current_node_id, int(assigned[local_idx]["pickup_node_id"])))
+                nearest_distance = travel_seconds(current_node_id, int(assigned[nearest_local_idx]["pickup_node_id"]))
+                if not math.isfinite(nearest_distance):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"No drivable path found while building route for vehicle {car.get('plate_no') or car.get('vehicle_id')}",
+                    )
+
+                nearest = assigned[nearest_local_idx]
+                ordered.append(nearest)
+                remaining_indices.remove(nearest_local_idx)
+                current_node_id = int(nearest["pickup_node_id"])
+        else:
+            current_lat = float(car["parking_ref_lat"])
+            current_lng = float(car["parking_ref_lng"])
+            while remaining_indices:
+                nearest_local_idx = min(
+                    remaining_indices,
+                    key=lambda local_idx: _haversine_km(
+                        current_lat,
+                        current_lng,
+                        assigned[local_idx]["pickup_lat"],
+                        assigned[local_idx]["pickup_lng"],
+                    ),
                 )
-
-            nearest = assigned[nearest_local_idx]
-            ordered.append(nearest)
-            remaining_indices.remove(nearest_local_idx)
-            current_node_id = int(nearest["pickup_node_id"])
+                nearest = assigned[nearest_local_idx]
+                ordered.append(nearest)
+                remaining_indices.remove(nearest_local_idx)
+                current_lat = nearest["pickup_lat"]
+                current_lng = nearest["pickup_lng"]
 
         earliest_shift = min(
             (_parse_time(req.get("shift_start_time")) for req in ordered),
@@ -583,20 +699,29 @@ def run_pickup_routing(
         )
         office_arrival_dt = _combine_dt(service_date, earliest_shift) - timedelta(minutes=office_buffer_minutes)
 
-        ordered_node_sequence: list[int] = [int(car["parking_node_id"])]
-        for req in ordered:
-            ordered_node_sequence.append(int(req["pickup_node_id"]))
-        ordered_node_sequence.append(office_node_id)
+        if routing_engine == "osmnx":
+            ordered_node_sequence: list[int] = [int(car["parking_node_id"])]
+            for req in ordered:
+                ordered_node_sequence.append(int(req["pickup_node_id"]))
+            ordered_node_sequence.append(int(office_node_id))
 
-        try:
-            route_metrics = _compute_route_metrics(graph, ordered_node_sequence)
-        except nx.NetworkXNoPath:
-            raise HTTPException(
-                status_code=400,
-                detail=f"No drivable path to office for vehicle {car.get('plate_no') or car.get('vehicle_id')}",
-            )
+            try:
+                route_metrics = _compute_route_metrics(graph, ordered_node_sequence)
+            except nx.NetworkXNoPath:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"No drivable path to office for vehicle {car.get('plate_no') or car.get('vehicle_id')}",
+                )
+        else:
+            lightweight_points = [
+                {"lat": float(car["parking_ref_lat"]), "lng": float(car["parking_ref_lng"])}
+            ]
+            for req in ordered:
+                lightweight_points.append({"lat": float(req["pickup_lat"]), "lng": float(req["pickup_lng"])})
+            lightweight_points.append({"lat": office_lat, "lng": office_lng})
+            route_metrics = _compute_lightweight_route_metrics(lightweight_points, average_speed_kmph)
 
-        route_source = "osmnx"
+        route_source = routing_engine
         source_summary["route_geometry"][route_source] += 1
         leg_durations_seconds = route_metrics.get("leg_durations_seconds", [])
         segment_minutes = [max(1, int(round(float(sec) / 60.0))) for sec in leg_durations_seconds]
