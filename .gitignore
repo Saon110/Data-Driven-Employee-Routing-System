@@ -45,3 +45,5 @@ Thumbs.db
 *.tsbuildinfo
 
 api_doc.yaml
+
+backend/cache/

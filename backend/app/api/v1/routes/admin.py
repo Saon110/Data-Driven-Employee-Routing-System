@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import math
-import json
 import logging
 from datetime import date, datetime, time, timedelta
 from time import perf_counter
 from typing import Any
-from urllib.parse import urlencode
-from urllib.request import urlopen
+
+import networkx as nx
+import osmnx as ox
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
@@ -16,6 +16,20 @@ from app.db.supabase_client import supabase
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 logger = logging.getLogger("app.admin.routing")
+
+DHAKA_BBOX = {
+    "north": 23.9,
+    "south": 23.7,
+    "east": 90.5,
+    "west": 90.3,
+}
+
+_GRAPH_CACHE: Any = None
+
+
+def _progress(message: str) -> None:
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    print(f"[routing {timestamp}] {message}")
 
 
 def _require_admin(current_user: dict = Depends(get_current_user)) -> dict:
@@ -50,123 +64,101 @@ def _combine_dt(service_date: str, t: time) -> datetime:
     return datetime.combine(parsed_date, t)
 
 
-def _osrm_route(points: list[tuple[float, float]], average_speed_kmph: float) -> dict[str, Any]:
-    # Fallback to straight-line estimates if OSRM is unavailable.
-    def fallback() -> dict[str, Any]:
-        leg_durations_seconds: list[float] = []
-        total_distance_km = 0.0
+def _get_graph() -> Any:
+    global _GRAPH_CACHE
+    if _GRAPH_CACHE is not None:
+        _progress("Using cached OSMnx graph")
+        return _GRAPH_CACHE
 
-        for i in range(len(points) - 1):
-            a = points[i]
-            b = points[i + 1]
-            km = _haversine_km(a[0], a[1], b[0], b[1])
-            total_distance_km += km
-            if average_speed_kmph > 0:
-                leg_durations_seconds.append(max(60.0, (km / average_speed_kmph) * 3600.0))
-            else:
-                leg_durations_seconds.append(60.0)
+    ox.settings.use_cache = True
+    ox.settings.log_console = False
+    _progress("Loading OSMnx graph for Dhaka (first run may take time)")
 
-        return {
-            "distance_km": total_distance_km,
-            "duration_seconds": sum(leg_durations_seconds),
-            "duration_min": sum(leg_durations_seconds) / 60.0,
-            "leg_durations_seconds": leg_durations_seconds,
-            "geometry": [{"lat": lat, "lng": lng} for lat, lng in points],
-            "source": "fallback",
-        }
+    try:
+        bbox = (DHAKA_BBOX["west"], DHAKA_BBOX["south"], DHAKA_BBOX["east"], DHAKA_BBOX["north"])
+        graph = ox.graph_from_bbox(bbox=bbox, network_type="drive")
+    except TypeError:
+        graph = ox.graph_from_bbox(
+            DHAKA_BBOX["north"],
+            DHAKA_BBOX["south"],
+            DHAKA_BBOX["east"],
+            DHAKA_BBOX["west"],
+            network_type="drive",
+        )
 
-    if len(points) < 2:
+    graph = ox.add_edge_speeds(graph)
+    graph = ox.add_edge_travel_times(graph)
+    _GRAPH_CACHE = graph
+    _progress(f"OSMnx graph ready: nodes={len(graph.nodes)} edges={len(graph.edges)}")
+    logger.info("OSMnx graph ready: nodes=%s edges=%s", len(graph.nodes), len(graph.edges))
+    return graph
+
+
+def _nearest_node(graph: Any, lat: float, lng: float) -> int:
+    try:
+        node_id = ox.distance.nearest_nodes(graph, X=lng, Y=lat)
+    except ImportError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail="Routing dependency missing: install scikit-learn and restart backend",
+        ) from exc
+    return int(node_id)
+
+
+def _shortest_travel_seconds(graph: Any, source_node: int, target_node: int) -> float:
+    if source_node == target_node:
+        return 0.0
+    try:
+        return float(nx.shortest_path_length(graph, source_node, target_node, weight="travel_time"))
+    except nx.NetworkXNoPath:
+        return float("inf")
+
+
+def _compute_route_metrics(graph: Any, node_path: list[int]) -> dict[str, Any]:
+    if len(node_path) < 2:
+        node = graph.nodes[node_path[0]] if node_path else None
         return {
             "distance_km": 0.0,
             "duration_seconds": 0.0,
             "duration_min": 0.0,
             "leg_durations_seconds": [],
-            "geometry": [{"lat": lat, "lng": lng} for lat, lng in points],
-            "source": "fallback",
+            "geometry": [{"lat": float(node["y"]), "lng": float(node["x"])}] if node else [],
+            "source": "osmnx",
         }
 
-    try:
-        coords = ";".join([f"{lng},{lat}" for lat, lng in points])
-        query = urlencode(
-            {
-                "overview": "full",
-                "geometries": "geojson",
-                "steps": "false",
-                "alternatives": "false",
-            }
-        )
-        url = f"https://router.project-osrm.org/route/v1/driving/{coords}?{query}"
+    route_nodes: list[int] = [node_path[0]]
+    leg_durations_seconds: list[float] = []
+    total_distance_m = 0.0
+    total_duration_s = 0.0
 
-        with urlopen(url, timeout=8) as response:
-            data = json.loads(response.read().decode("utf-8"))
+    for i in range(len(node_path) - 1):
+        source_node = node_path[i]
+        target_node = node_path[i + 1]
+        path_nodes = nx.shortest_path(graph, source_node, target_node, weight="travel_time")
+        if i > 0:
+            route_nodes.extend(path_nodes[1:])
+        else:
+            route_nodes = list(path_nodes)
 
-        routes = data.get("routes") or []
-        if not routes:
-            return fallback()
+        segment_duration_s = float(nx.path_weight(graph, path_nodes, weight="travel_time"))
+        segment_distance_m = float(nx.path_weight(graph, path_nodes, weight="length"))
+        leg_durations_seconds.append(segment_duration_s)
+        total_duration_s += segment_duration_s
+        total_distance_m += segment_distance_m
 
-        route = routes[0]
-        legs = route.get("legs") or []
-        leg_durations_seconds = [float(leg.get("duration", 0.0)) for leg in legs]
+    geometry = [
+        {"lat": float(graph.nodes[node_id]["y"]), "lng": float(graph.nodes[node_id]["x"])}
+        for node_id in route_nodes
+    ]
 
-        geometry_coords = route.get("geometry", {}).get("coordinates", [])
-        geometry = [{"lat": float(c[1]), "lng": float(c[0])} for c in geometry_coords if len(c) >= 2]
-
-        distance_km = float(route.get("distance", 0.0)) / 1000.0
-        duration_seconds = float(route.get("duration", 0.0))
-
-        if len(leg_durations_seconds) != len(points) - 1:
-            # Ensure timing logic still works if API omits or shortens legs.
-            return fallback()
-
-        return {
-            "distance_km": distance_km,
-            "duration_seconds": duration_seconds,
-            "duration_min": duration_seconds / 60.0,
-            "leg_durations_seconds": leg_durations_seconds,
-            "geometry": geometry if geometry else [{"lat": lat, "lng": lng} for lat, lng in points],
-            "source": "osrm",
-        }
-    except Exception:
-        return fallback()
-
-
-def _osrm_table_matrix(points: list[tuple[float, float]], average_speed_kmph: float) -> dict[str, Any]:
-    def fallback() -> dict[str, Any]:
-        n = len(points)
-        matrix = [[0.0 for _ in range(n)] for _ in range(n)]
-        for i in range(n):
-            for j in range(n):
-                if i == j:
-                    matrix[i][j] = 0.0
-                    continue
-                km = _haversine_km(points[i][0], points[i][1], points[j][0], points[j][1])
-                if average_speed_kmph > 0:
-                    matrix[i][j] = max(60.0, (km / average_speed_kmph) * 3600.0)
-                else:
-                    matrix[i][j] = 60.0
-        return {"durations": matrix, "source": "fallback"}
-
-    if len(points) <= 1:
-        return {"durations": [[0.0]], "source": "fallback"}
-
-    try:
-        coords = ";".join([f"{lng},{lat}" for lat, lng in points])
-        query = urlencode({"annotations": "duration"})
-        url = f"https://router.project-osrm.org/table/v1/driving/{coords}?{query}"
-
-        with urlopen(url, timeout=10) as response:
-            data = json.loads(response.read().decode("utf-8"))
-
-        durations = data.get("durations")
-        if not durations or len(durations) != len(points):
-            return fallback()
-
-        return {
-            "durations": durations,
-            "source": "osrm",
-        }
-    except Exception:
-        return fallback()
+    return {
+        "distance_km": total_distance_m / 1000.0,
+        "duration_seconds": total_duration_s,
+        "duration_min": total_duration_s / 60.0,
+        "leg_durations_seconds": leg_durations_seconds,
+        "geometry": geometry,
+        "source": "osmnx",
+    }
 
 
 @router.get("/pickup-routing/input")
@@ -253,7 +245,9 @@ def run_pickup_routing(
     logger.info("service_date=%s shift_start_time=%s office=(%.6f, %.6f)", service_date, shift_start_time, office_lat, office_lng)
     logger.info("params: office_buffer=%sm stop_dwell=%sm speed=%.2f km/h", office_buffer_minutes, stop_dwell_minutes, average_speed_kmph)
     logger.info("=" * 60)
+    _progress("Routing started")
 
+    _progress("Loading pickup requests")
     pickup_query = supabase.table("pickup_request").select(
         "pickup_id,employee_id,pickup_lat,pickup_lng,shift_start_time,service_date,status,request_type"
     ).eq("service_date", service_date)
@@ -263,6 +257,7 @@ def run_pickup_routing(
 
     pickup_rows = pickup_query.execute().data or []
     pending_rows = [row for row in pickup_rows if str(row.get("status", "")).lower() == "pending"]
+    _progress(f"Pickup requests loaded: total={len(pickup_rows)} pending={len(pending_rows)}")
 
     logger.info("pickup requests loaded: total=%s pending=%s", len(pickup_rows), len(pending_rows))
 
@@ -284,6 +279,7 @@ def run_pickup_routing(
         }
 
     employee_ids = sorted({row["employee_id"] for row in pending_rows if row.get("employee_id") is not None})
+    _progress("Loading employee profiles")
     employees = (
         supabase.table("employee")
         .select("employee_id,user_id,home_lat,home_lng,is_active")
@@ -296,6 +292,7 @@ def run_pickup_routing(
     logger.info("employee profiles loaded: %s", len(employees))
 
     user_ids = sorted({row["user_id"] for row in employees if row.get("user_id") is not None})
+    _progress("Loading employee user details")
     users = (
         supabase.table("users")
         .select("user_id,name,email,phone")
@@ -307,6 +304,7 @@ def run_pickup_routing(
     user_by_id = {row["user_id"]: row for row in users}
     logger.info("employee user rows loaded: %s", len(users))
 
+    _progress("Loading drivers and vehicles")
     all_drivers = (
         supabase.table("driver")
         .select("driver_id,user_id,license_no,status")
@@ -354,7 +352,7 @@ def run_pickup_routing(
 
     fleet = []
     mapped_count = 0
-    fallback_count = 0
+    reassigned_count = 0
     for vehicle in vehicles:
         mapped_driver_id = vehicle.get("driver_id")
         driver = None
@@ -366,7 +364,7 @@ def run_pickup_routing(
 
         # If mapped driver is unavailable, fall back to any unassigned available driver.
         if driver is None:
-            assignment_source = "fallback"
+            assignment_source = "reassigned"
             for candidate in remaining_available_drivers:
                 candidate_id = candidate.get("driver_id")
                 if candidate_id is None or candidate_id in used_driver_ids:
@@ -380,7 +378,7 @@ def run_pickup_routing(
         if assignment_source == "mapped":
             mapped_count += 1
         else:
-            fallback_count += 1
+            reassigned_count += 1
 
         driver_id_value = driver.get("driver_id")
         if driver_id_value is not None:
@@ -410,16 +408,19 @@ def run_pickup_routing(
     if not fleet:
         raise HTTPException(status_code=400, detail="No vehicle-driver pairs available for routing")
 
+    _progress(f"Fleet prepared: {len(fleet)} active vehicle-driver pairs")
+
     logger.info(
-        "vehicle-driver pairs built: fleet=%s mapped=%s fallback=%s unmapped=%s",
+        "vehicle-driver pairs built: fleet=%s mapped=%s reassigned=%s unmapped=%s",
         len(fleet),
         mapped_count,
-        fallback_count,
+        reassigned_count,
         max(0, len(vehicles) - len(fleet)),
     )
 
     skipped_requests = []
     candidate_requests = []
+    _progress("Validating candidate pickup coordinates")
     logger.info("building candidate pickup list from pending requests...")
     for row in pending_rows:
         employee_id = row.get("employee_id")
@@ -454,25 +455,35 @@ def run_pickup_routing(
         len(candidate_requests),
         len(skipped_requests),
     )
+    _progress(f"Candidates ready: valid={len(candidate_requests)} skipped={len(skipped_requests)}")
 
-    parking_points: list[tuple[float, float]] = []
+    graph = _get_graph()
+    _progress("Mapping pickups and vehicles to nearest graph nodes")
+
+    for req in candidate_requests:
+        req["pickup_node_id"] = _nearest_node(graph, req["pickup_lat"], req["pickup_lng"])
+
     for car in fleet:
         ref_lat = float(car["parking_lat"]) if car["parking_lat"] is not None else office_lat
         ref_lng = float(car["parking_lng"]) if car["parking_lng"] is not None else office_lng
-        parking_points.append((ref_lat, ref_lng))
+        car["parking_node_id"] = _nearest_node(graph, ref_lat, ref_lng)
 
-    pickup_points: list[tuple[float, float]] = [(req["pickup_lat"], req["pickup_lng"]) for req in candidate_requests]
-    assignment_points = pickup_points + parking_points
-    assignment_matrix_result = _osrm_table_matrix(assignment_points, average_speed_kmph)
-    assignment_durations = assignment_matrix_result["durations"]
-    pickup_count = len(pickup_points)
+    office_node_id = _nearest_node(graph, office_lat, office_lng)
+
+    pair_travel_cache: dict[tuple[int, int], float] = {}
+
+    def travel_seconds(source_node: int, target_node: int) -> float:
+        key = (source_node, target_node)
+        if key not in pair_travel_cache:
+            pair_travel_cache[key] = _shortest_travel_seconds(graph, source_node, target_node)
+        return pair_travel_cache[key]
 
     logger.info(
-        "assignment matrix prepared: pickups=%s cars=%s source=%s",
-        pickup_count,
-        len(parking_points),
-        assignment_matrix_result.get("source", "unknown"),
+        "assignment matrix prepared: pickups=%s cars=%s source=osmnx",
+        len(candidate_requests),
+        len(fleet),
     )
+    _progress("Assignment matrix prepared from OSMnx travel times")
 
     unassigned_requests = []
     logger.info("=" * 60)
@@ -489,10 +500,9 @@ def run_pickup_routing(
             if len(car["assigned_requests"]) >= car["capacity"]:
                 continue
 
-            car_matrix_idx = pickup_count + idx
-            travel_seconds = float(assignment_durations[req_idx][car_matrix_idx] or float("inf"))
-            if travel_seconds < best_travel_seconds:
-                best_travel_seconds = travel_seconds
+            req_to_car_seconds = travel_seconds(int(req["pickup_node_id"]), int(car["parking_node_id"]))
+            if req_to_car_seconds < best_travel_seconds:
+                best_travel_seconds = req_to_car_seconds
                 best_idx = idx
 
         if best_idx is None:
@@ -500,6 +510,9 @@ def run_pickup_routing(
             continue
 
         fleet[best_idx]["assigned_requests"].append(req)
+
+        if (req_idx + 1) % 10 == 0 or (req_idx + 1) == len(candidate_requests):
+            _progress(f"Assigned {req_idx + 1}/{len(candidate_requests)} employees")
 
     logger.info("assignment complete: assigned=%s unassigned=%s", len(candidate_requests) - len(unassigned_requests), len(unassigned_requests))
     logger.info("=" * 60)
@@ -517,10 +530,16 @@ def run_pickup_routing(
 
     cars_output = []
     employee_assignments: dict[str, Any] = {}
+    source_summary = {
+        "assignment_matrix_source": "osmnx",
+        "route_geometry": {"osmnx": 0, "unknown": 0},
+        "route_matrix": {"osmnx": 0, "unknown": 0},
+    }
 
     logger.info("=" * 60)
     logger.info("CALCULATING ROUTES")
     logger.info("=" * 60)
+    _progress("Computing per-vehicle stop order and route geometry")
 
     for car in fleet:
         assigned = car["assigned_requests"]
@@ -533,29 +552,30 @@ def run_pickup_routing(
             (car.get("driver") or {}).get("name", "Unknown"),
             len(assigned),
         )
+        _progress(
+            f"Routing vehicle {car.get('plate_no') or car.get('vehicle_id')} with {len(assigned)} stops"
+        )
 
-        start_lat = float(car["parking_lat"]) if car["parking_lat"] is not None else office_lat
-        start_lng = float(car["parking_lng"]) if car["parking_lng"] is not None else office_lng
-
-        stop_points = [(req["pickup_lat"], req["pickup_lng"]) for req in assigned]
-        # index 0=start parking, 1..n=stops, n+1=office
-        route_points_for_matrix: list[tuple[float, float]] = [(start_lat, start_lng)] + stop_points + [(office_lat, office_lng)]
-        route_matrix_result = _osrm_table_matrix(route_points_for_matrix, average_speed_kmph)
-        route_matrix = route_matrix_result["durations"]
+        route_matrix_source = "osmnx"
+        source_summary["route_matrix"][route_matrix_source] += 1
 
         remaining_indices = list(range(len(assigned)))
-        current_idx = 0
+        current_node_id = int(car["parking_node_id"])
         ordered = []
 
         while remaining_indices:
-            nearest_local_idx = min(
-                remaining_indices,
-                key=lambda local_idx: float(route_matrix[current_idx][local_idx + 1] or float("inf")),
-            )
+            nearest_local_idx = min(remaining_indices, key=lambda local_idx: travel_seconds(current_node_id, int(assigned[local_idx]["pickup_node_id"])))
+            nearest_distance = travel_seconds(current_node_id, int(assigned[nearest_local_idx]["pickup_node_id"]))
+            if not math.isfinite(nearest_distance):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"No drivable path found while building route for vehicle {car.get('plate_no') or car.get('vehicle_id')}",
+                )
+
             nearest = assigned[nearest_local_idx]
             ordered.append(nearest)
             remaining_indices.remove(nearest_local_idx)
-            current_idx = nearest_local_idx + 1
+            current_node_id = int(nearest["pickup_node_id"])
 
         earliest_shift = min(
             (_parse_time(req.get("shift_start_time")) for req in ordered),
@@ -563,27 +583,29 @@ def run_pickup_routing(
         )
         office_arrival_dt = _combine_dt(service_date, earliest_shift) - timedelta(minutes=office_buffer_minutes)
 
-        point_sequence: list[tuple[float, float]] = [(start_lat, start_lng)]
+        ordered_node_sequence: list[int] = [int(car["parking_node_id"])]
         for req in ordered:
-            point_sequence.append((req["pickup_lat"], req["pickup_lng"]))
-        point_sequence.append((office_lat, office_lng))
+            ordered_node_sequence.append(int(req["pickup_node_id"]))
+        ordered_node_sequence.append(office_node_id)
 
-        route_metrics = _osrm_route(point_sequence, average_speed_kmph)
+        try:
+            route_metrics = _compute_route_metrics(graph, ordered_node_sequence)
+        except nx.NetworkXNoPath:
+            raise HTTPException(
+                status_code=400,
+                detail=f"No drivable path to office for vehicle {car.get('plate_no') or car.get('vehicle_id')}",
+            )
+
+        route_source = "osmnx"
+        source_summary["route_geometry"][route_source] += 1
         leg_durations_seconds = route_metrics.get("leg_durations_seconds", [])
         segment_minutes = [max(1, int(round(float(sec) / 60.0))) for sec in leg_durations_seconds]
 
-        if len(segment_minutes) != len(point_sequence) - 1:
-            segment_minutes = []
-            seq_matrix_result = _osrm_table_matrix(point_sequence, average_speed_kmph)
-            seq_matrix = seq_matrix_result["durations"]
-            for idx in range(len(point_sequence) - 1):
-                seconds = float(seq_matrix[idx][idx + 1] or 0.0)
-                if seconds <= 0:
-                    a = point_sequence[idx]
-                    b = point_sequence[idx + 1]
-                    km = _haversine_km(a[0], a[1], b[0], b[1])
-                    seconds = max(60.0, (km / max(average_speed_kmph, 1.0)) * 3600.0)
-                segment_minutes.append(max(1, int(round(seconds / 60.0))))
+        if len(segment_minutes) != len(ordered_node_sequence) - 1:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Unexpected route leg mismatch for vehicle {car.get('plate_no') or car.get('vehicle_id')}",
+            )
 
         # Backward schedule from office arrival: subtract leg-by-leg and dwell between stops.
         # segment_minutes index mapping: 0=start->stop1, 1=stop1->stop2, ..., n=stopN->office
@@ -649,6 +671,8 @@ def run_pickup_routing(
                 "office_buffer_minutes_used": office_buffer_minutes,
                 "route_distance_km": round(float(route_metrics.get("distance_km", 0.0) or 0.0), 3),
                 "route_travel_time_min": round(float(route_metrics.get("duration_min", 0.0) or 0.0), 1),
+                "route_geometry_source": route_source,
+                "route_matrix_source": route_matrix_source,
                 "route_geometry": route_metrics.get("geometry", []),
                 "assigned_employee_count": len(ordered),
                 "assigned_employee_ids": [stop["employee_id"] for stop in stops_output],
@@ -662,8 +686,11 @@ def run_pickup_routing(
             len(stops_output),
             float(route_metrics.get("distance_km", 0.0) or 0.0),
             float(route_metrics.get("duration_min", 0.0) or 0.0),
-            route_metrics.get("source", "unknown"),
-            route_matrix_result.get("source", "unknown"),
+            route_source,
+            route_matrix_source,
+        )
+        _progress(
+            f"Done vehicle {car.get('plate_no') or car.get('vehicle_id')}: distance={float(route_metrics.get('distance_km', 0.0) or 0.0):.2f}km"
         )
 
     total_elapsed = perf_counter() - started_at
@@ -671,8 +698,15 @@ def run_pickup_routing(
     logger.info("SOLUTION STATISTICS")
     logger.info("cars_used=%s assigned=%s unassigned=%s skipped=%s", len(cars_output), sum(car["assigned_employee_count"] for car in cars_output), len(unassigned_requests), len(skipped_requests))
     logger.info("total_distance_km=%.3f total_travel_time_min=%.1f", sum(float(car.get("route_distance_km", 0.0) or 0.0) for car in cars_output), sum(float(car.get("route_travel_time_min", 0.0) or 0.0) for car in cars_output))
+    logger.info(
+        "source usage: assignment_matrix=%s route_geometry=%s route_matrix=%s",
+        source_summary["assignment_matrix_source"],
+        source_summary["route_geometry"],
+        source_summary["route_matrix"],
+    )
     logger.info("total_elapsed_sec=%.2f", total_elapsed)
     logger.info("=" * 60)
+    _progress(f"Routing finished in {total_elapsed:.2f}s")
 
     return {
         "service_date": service_date,
@@ -684,6 +718,7 @@ def run_pickup_routing(
             "average_speed_kmph": average_speed_kmph,
             "office_arrival_window_minutes": {"min": 5, "max": 10},
         },
+        "source_summary": source_summary,
         "summary": {
             "total_requests": len(candidate_requests),
             "assigned_requests": sum(car["assigned_employee_count"] for car in cars_output),
