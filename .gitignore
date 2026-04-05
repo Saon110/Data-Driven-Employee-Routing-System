@@ -1,5 +1,17 @@
 *.pdf
 .DS_Store
+backend/.venv/
+backend/__pycache__/
+backend/.env
+backend/app/core/__pycache__/
+backend/app/db/__pycache__/
+backend/app/schemas/__pycache__/
+backend/app/__pycache__/
+backend/app/api/v1/routes/__pycache__/
+backend/app/repositories/__pycache__/
+backend/app/services/__pycache__/
+backend/app/services/__pycache__/
+
 
 # Node modules
 node_modules/
