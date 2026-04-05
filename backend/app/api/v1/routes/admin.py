@@ -243,7 +243,8 @@ def run_pickup_routing(
     shift_start_time = payload.get("shift_start_time")
     office_lat = float(payload.get("office_lat", 23.8103))
     office_lng = float(payload.get("office_lng", 90.4125))
-    office_buffer_minutes = int(payload.get("office_buffer_minutes", 30))
+    office_buffer_minutes = int(payload.get("office_buffer_minutes", 8))
+    office_buffer_minutes = max(5, min(10, office_buffer_minutes))
     stop_dwell_minutes = int(payload.get("stop_dwell_minutes", 2))
     average_speed_kmph = float(payload.get("average_speed_kmph", 25.0))
 
@@ -584,14 +585,28 @@ def run_pickup_routing(
                     seconds = max(60.0, (km / max(average_speed_kmph, 1.0)) * 3600.0)
                 segment_minutes.append(max(1, int(round(seconds / 60.0))))
 
-        total_minutes = sum(segment_minutes) + max(0, len(ordered) - 1) * stop_dwell_minutes
-        route_start_dt = office_arrival_dt - timedelta(minutes=total_minutes)
+        # Backward schedule from office arrival: subtract leg-by-leg and dwell between stops.
+        # segment_minutes index mapping: 0=start->stop1, 1=stop1->stop2, ..., n=stopN->office
+        pickup_time_by_order: list[datetime] = []
+        if ordered:
+            pickup_time_by_order = [office_arrival_dt for _ in ordered]
+            backward_dt = office_arrival_dt
+
+            for stop_idx in range(len(ordered) - 1, -1, -1):
+                backward_dt = backward_dt - timedelta(minutes=segment_minutes[stop_idx + 1])
+                pickup_time_by_order[stop_idx] = backward_dt
+
+                if stop_idx > 0:
+                    backward_dt = backward_dt - timedelta(minutes=stop_dwell_minutes)
+
+            route_start_dt = pickup_time_by_order[0] - timedelta(minutes=segment_minutes[0])
+        else:
+            route_start_dt = office_arrival_dt
 
         stops_output = []
-        now_dt = route_start_dt
         for idx, req in enumerate(ordered):
-            now_dt = now_dt + timedelta(minutes=segment_minutes[idx])
-            pickup_time = now_dt.time().strftime("%H:%M:%S")
+            pickup_dt = pickup_time_by_order[idx]
+            pickup_time = pickup_dt.time().strftime("%H:%M:%S")
 
             stop = {
                 "order": idx + 1,
@@ -618,10 +633,6 @@ def run_pickup_routing(
                     "lng": req["pickup_lng"],
                 },
             }
-
-            if idx < len(ordered) - 1:
-                now_dt = now_dt + timedelta(minutes=stop_dwell_minutes)
-
         cars_output.append(
             {
                 "vehicle_id": car["vehicle_id"],
@@ -635,6 +646,7 @@ def run_pickup_routing(
                 "office_location": {"lat": office_lat, "lng": office_lng},
                 "route_start_time": route_start_dt.time().strftime("%H:%M:%S"),
                 "office_arrival_time": office_arrival_dt.time().strftime("%H:%M:%S"),
+                "office_buffer_minutes_used": office_buffer_minutes,
                 "route_distance_km": round(float(route_metrics.get("distance_km", 0.0) or 0.0), 3),
                 "route_travel_time_min": round(float(route_metrics.get("duration_min", 0.0) or 0.0), 1),
                 "route_geometry": route_metrics.get("geometry", []),
@@ -670,6 +682,7 @@ def run_pickup_routing(
             "office_buffer_minutes": office_buffer_minutes,
             "stop_dwell_minutes": stop_dwell_minutes,
             "average_speed_kmph": average_speed_kmph,
+            "office_arrival_window_minutes": {"min": 5, "max": 10},
         },
         "summary": {
             "total_requests": len(candidate_requests),

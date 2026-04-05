@@ -21,6 +21,7 @@ export const AdminRoutingPage: React.FC = () => {
   const [shiftStartTime, setShiftStartTime] = useState('22:00:00');
   const [officeLat, setOfficeLat] = useState('23.8103');
   const [officeLng, setOfficeLng] = useState('90.4125');
+  const [officeBufferMinutes, setOfficeBufferMinutes] = useState('8');
   const [isLoadingData, setIsLoadingData] = useState(false);
   const [isRunning, setIsRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -57,14 +58,21 @@ export const AdminRoutingPage: React.FC = () => {
   const selectedMarkers = useMemo(() => {
     if (!selectedCar) return [];
 
-    const markers: Array<{ position: [number, number]; label: string; color?: string; badge?: string | number }> = [];
+    const markers: Array<{
+      position: [number, number];
+      label: string;
+      color?: string;
+      badge?: string | number;
+      variant?: 'office' | 'parking' | 'stop' | 'default';
+    }> = [];
 
     if (selectedCar.parking_location?.lat != null && selectedCar.parking_location?.lng != null) {
       markers.push({
         position: [selectedCar.parking_location.lat, selectedCar.parking_location.lng],
         label: `${selectedCar.plate_no} Parking`,
-        color: '#0ea5e9',
-        badge: 'P',
+        color: selectedRouteColor,
+        badge: 'C',
+        variant: 'parking',
       });
     }
 
@@ -74,6 +82,7 @@ export const AdminRoutingPage: React.FC = () => {
         label: `Stop ${idx + 1}: ${stop.employee_name} (${stop.pickup_time})`,
         color: selectedRouteColor,
         badge: idx + 1,
+        variant: 'stop',
       });
     });
 
@@ -81,8 +90,9 @@ export const AdminRoutingPage: React.FC = () => {
       markers.push({
         position: [selectedCar.office_location.lat, selectedCar.office_location.lng],
         label: 'Office',
-        color: '#ef4444',
+        color: '#111111',
         badge: 'O',
+        variant: 'office',
       });
     }
 
@@ -100,9 +110,23 @@ export const AdminRoutingPage: React.FC = () => {
   }, [selectedMarkers, selectedRoutePoints]);
 
   const allRoutesMarkers = useMemo(() => {
-    if (!solution?.cars?.length) return [] as Array<{ position: [number, number]; label: string; color?: string; badge?: string | number }>;
+    if (!solution?.cars?.length) {
+      return [] as Array<{
+        position: [number, number];
+        label: string;
+        color?: string;
+        badge?: string | number;
+        variant?: 'office' | 'parking' | 'stop' | 'default';
+      }>;
+    }
 
-    const markers: Array<{ position: [number, number]; label: string; color?: string; badge?: string | number }> = [];
+    const markers: Array<{
+      position: [number, number];
+      label: string;
+      color?: string;
+      badge?: string | number;
+      variant?: 'office' | 'parking' | 'stop' | 'default';
+    }> = [];
 
     solution.cars.forEach((car: any, idx: number) => {
       const color = ROUTE_COLORS[idx % ROUTE_COLORS.length];
@@ -112,7 +136,8 @@ export const AdminRoutingPage: React.FC = () => {
           position: [car.parking_location.lat, car.parking_location.lng],
           label: `${car.plate_no} Parking`,
           color,
-          badge: 'P',
+          badge: 'C',
+          variant: 'parking',
         });
       }
 
@@ -122,6 +147,7 @@ export const AdminRoutingPage: React.FC = () => {
           label: `${car.plate_no} Stop ${stop.order}: ${stop.employee_name}`,
           color,
           badge: stop.order,
+          variant: 'stop',
         });
       });
     });
@@ -132,6 +158,7 @@ export const AdminRoutingPage: React.FC = () => {
         label: 'Office',
         color: '#111827',
         badge: 'O',
+        variant: 'office',
       });
     }
 
@@ -300,6 +327,7 @@ export const AdminRoutingPage: React.FC = () => {
         shift_start_time: shiftStartTime || undefined,
         office_lat: Number(officeLat),
         office_lng: Number(officeLng),
+        office_buffer_minutes: Number(officeBufferMinutes),
       });
       setSolution(data);
       setSelectedCarIdx(0);
@@ -341,7 +369,7 @@ export const AdminRoutingPage: React.FC = () => {
             </CardDescription>
           </CardHeader>
           <CardContent>
-            <div className="grid grid-cols-1 gap-4 md:grid-cols-4">
+            <div className="grid grid-cols-1 gap-4 md:grid-cols-5">
               <div className="space-y-2">
                 <Label htmlFor="serviceDate">Service Date</Label>
                 <Input id="serviceDate" type="date" value={serviceDate} onChange={(e) => setServiceDate(e.target.value)} />
@@ -357,6 +385,17 @@ export const AdminRoutingPage: React.FC = () => {
               <div className="space-y-2">
                 <Label htmlFor="officeLng">Office Longitude</Label>
                 <Input id="officeLng" value={officeLng} onChange={(e) => setOfficeLng(e.target.value)} />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="officeBuffer">Office Buffer (5-10 min)</Label>
+                <Input
+                  id="officeBuffer"
+                  type="number"
+                  min={5}
+                  max={10}
+                  value={officeBufferMinutes}
+                  onChange={(e) => setOfficeBufferMinutes(e.target.value)}
+                />
               </div>
             </div>
 
