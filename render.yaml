@@ -27,6 +27,5 @@ services:
     dockerfilePath: ./Frontend/Dockerfile
     plan: free
     envVars:
-      # Set this to your backend Render URL after first deploy, e.g. https://dders-backend.onrender.com
       - key: BACKEND_URL
-        sync: false
+        value: https://dders-backend.onrender.com
