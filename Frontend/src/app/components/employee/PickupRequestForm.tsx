@@ -8,6 +8,7 @@ import { Label } from '../ui/label';
 import { TimePicker } from '../ui/time-picker';
 import { InteractiveMap } from '../shared/InteractiveMap';
 import { useAuth } from '../../context/AuthContext';
+import { pickupRequestApi } from '../../services/transportApi';
 
 const WEEKDAYS = [
   { id: 'monday', label: 'Monday' },
@@ -82,10 +83,12 @@ export const PickupRequestForm: React.FC = () => {
 
   const handleSubmit = async () => {
     setIsSubmitting(true);
-    
-    // Simulate API call
-    await new Promise(resolve => setTimeout(resolve, 1500));
-    
+
+    await pickupRequestApi.submitWeeklyRegular({
+      employeeId: user?.id ?? '1',
+      schedules,
+    });
+
     setIsSubmitting(false);
     setSubmitted(true);
   };

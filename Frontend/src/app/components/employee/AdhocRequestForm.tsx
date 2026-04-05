@@ -9,6 +9,7 @@ import { TimePicker } from '../ui/time-picker';
 import { InteractiveMap } from '../shared/InteractiveMap';
 import { useAuth } from '../../context/AuthContext';
 import { mockRequests } from '../../data/mockData';
+import { pickupRequestApi } from '../../services/transportApi';
 
 export const AdhocRequestForm: React.FC = () => {
   const { user } = useAuth();
@@ -52,10 +53,15 @@ export const AdhocRequestForm: React.FC = () => {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setIsSubmitting(true);
-    
-    // Simulate API call
-    await new Promise(resolve => setTimeout(resolve, 1000));
-    
+
+    await pickupRequestApi.submitAdhoc({
+      employeeId: user?.id ?? '1',
+      latitude: formData.latitude,
+      longitude: formData.longitude,
+      shiftTime: formData.shiftTime,
+      serviceDate: formData.serviceDate,
+    });
+
     setIsSubmitting(false);
     setSubmitted(true);
   };

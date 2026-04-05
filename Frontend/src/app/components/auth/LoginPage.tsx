@@ -7,42 +7,32 @@ import { Label } from '../ui/label';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '../ui/card';
 import { RadioGroup, RadioGroupItem } from '../ui/radio-group';
 import { useAuth } from '../../context/AuthContext';
-import { mockUsers } from '../../data/mockData';
+import { authApi } from '../../services/transportApi';
 
 export const LoginPage: React.FC = () => {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
-  const [role, setRole] = useState<'employee' | 'driver'>('employee');
+  const [role, setRole] = useState<'employee' | 'driver' | 'admin'>('employee');
   const [error, setError] = useState('');
   const navigate = useNavigate();
   const { login } = useAuth();
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
 
-    // Mock authentication
-    const user = mockUsers.find(u => u.email === email && u.role === role);
-    
-    if (user) {
-      login(user);
+    try {
+      const result = await authApi.loginWithRole({ email, password, role });
+      login(result.user);
       if (role === 'employee') {
         navigate('/employee/dashboard');
+      } else if (role === 'admin') {
+        navigate('/admin');
       } else {
         navigate('/driver/route');
       }
-    } else {
+    } catch {
       setError('Invalid credentials or role mismatch');
-    }
-  };
-
-  // Quick login helper
-  const quickLogin = (userRole: 'employee' | 'driver') => {
-    const user = mockUsers.find(u => u.role === userRole);
-    if (user) {
-      setEmail(user.email);
-      setPassword('demo123');
-      setRole(userRole);
     }
   };
 
@@ -71,18 +61,24 @@ export const LoginPage: React.FC = () => {
               {/* Role Selection */}
               <div className="space-y-2">
                 <Label>Select Role</Label>
-                <RadioGroup value={role} onValueChange={(value) => setRole(value as 'employee' | 'driver')}>
-                  <div className="flex gap-4">
-                    <div className="flex items-center space-x-2 flex-1">
+                <RadioGroup value={role} onValueChange={(value) => setRole(value as 'employee' | 'driver' | 'admin')}>
+                  <div className="grid grid-cols-3 gap-2">
+                    <div className="flex items-center space-x-2">
                       <RadioGroupItem value="employee" id="employee" />
                       <Label htmlFor="employee" className="cursor-pointer font-normal">
                         Employee
                       </Label>
                     </div>
-                    <div className="flex items-center space-x-2 flex-1">
+                    <div className="flex items-center space-x-2">
                       <RadioGroupItem value="driver" id="driver" />
                       <Label htmlFor="driver" className="cursor-pointer font-normal">
                         Driver
+                      </Label>
+                    </div>
+                    <div className="flex items-center space-x-2">
+                      <RadioGroupItem value="admin" id="admin" />
+                      <Label htmlFor="admin" className="cursor-pointer font-normal">
+                        Admin
                       </Label>
                     </div>
                   </div>
@@ -130,44 +126,10 @@ export const LoginPage: React.FC = () => {
                 </div>
               )}
 
-              {/* Forgot Password */}
-              <div className="text-right">
-                <Link to="/forgot-password" className="text-sm text-blue-600 hover:underline">
-                  Forgot Password?
-                </Link>
-              </div>
-
               {/* Submit Button */}
               <Button type="submit" className="w-full bg-blue-600 hover:bg-blue-700">
                 Sign In
               </Button>
-
-              {/* Demo Accounts */}
-              <div className="pt-4 border-t border-gray-200">
-                <p className="text-xs text-gray-500 text-center mb-3">Quick Demo Login:</p>
-                <div className="flex gap-2">
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    className="flex-1 text-xs"
-                    onClick={() => quickLogin('employee')}
-                  >
-                    <UserCircle className="w-3 h-3 mr-1" />
-                    Employee
-                  </Button>
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    className="flex-1 text-xs"
-                    onClick={() => quickLogin('driver')}
-                  >
-                    <Car className="w-3 h-3 mr-1" />
-                    Driver
-                  </Button>
-                </div>
-              </div>
 
               {/* Sign Up Link */}
               <div className="text-center pt-4">

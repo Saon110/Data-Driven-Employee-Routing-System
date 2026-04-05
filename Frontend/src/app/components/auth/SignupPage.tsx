@@ -5,7 +5,7 @@ import { Button } from '../ui/button';
 import { Input } from '../ui/input';
 import { Label } from '../ui/label';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '../ui/card';
-import { useAuth } from '../../context/AuthContext';
+import { authApi } from '../../services/transportApi';
 
 export const SignupPage: React.FC = () => {
   const [formData, setFormData] = useState({
@@ -22,7 +22,6 @@ export const SignupPage: React.FC = () => {
   const [showConfirmPassword, setShowConfirmPassword] = useState(false);
   const [error, setError] = useState('');
   const navigate = useNavigate();
-  const { login } = useAuth();
 
   // Simulate auto-detection of location
   useEffect(() => {
@@ -38,7 +37,7 @@ export const SignupPage: React.FC = () => {
     }
   }, [formData.address]);
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
 
@@ -48,25 +47,24 @@ export const SignupPage: React.FC = () => {
       return;
     }
 
-    if (formData.password.length < 6) {
-      setError('Password must be at least 6 characters');
+    if (formData.password.length < 8) {
+      setError('Password must be at least 8 characters');
       return;
     }
 
-    // Mock user creation
-    const newUser = {
-      id: Date.now().toString(),
-      name: formData.fullName,
-      email: formData.email,
-      phone: formData.phone,
-      role: 'employee' as const,
-      address: formData.address,
-      latitude: formData.latitude,
-      longitude: formData.longitude,
-    };
-
-    login(newUser);
-    navigate('/employee/dashboard');
+    try {
+      await authApi.register({
+        name: formData.fullName,
+        email: formData.email,
+        phone: formData.phone,
+        password: formData.password,
+        role: 'Employee',
+      });
+      navigate('/login');
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Signup failed';
+      setError(message);
+    }
   };
 
   const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -209,7 +207,7 @@ export const SignupPage: React.FC = () => {
                       id="password"
                       name="password"
                       type={showPassword ? 'text' : 'password'}
-                      placeholder="Min. 6 characters"
+                      placeholder="Min. 8 characters"
                       value={formData.password}
                       onChange={handleChange}
                       className="pl-10 pr-10"

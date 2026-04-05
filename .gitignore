@@ -1,6 +1,6 @@
 *.pdf
 .DS_Store
-backend/.venv/
+backend/venv/
 backend/__pycache__/
 backend/.env
 backend/app/core/__pycache__/
@@ -43,3 +43,5 @@ Thumbs.db
 
 # TypeScript cache
 *.tsbuildinfo
+
+api_doc.yaml

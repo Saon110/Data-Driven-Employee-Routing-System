@@ -18,13 +18,22 @@ interface MapPickerProps {
     position: [number, number];
     label: string;
     color?: string;
+    badge?: string | number;
   }>;
   showRoute?: boolean;
+  routeColor?: string;
+  routes?: Array<{
+    points: [number, number][];
+    color?: string;
+    weight?: number;
+    opacity?: number;
+  }>;
   height?: string;
 }
 
 // Create custom colored marker icons
-const createColoredIcon = (color: string, number?: number) => {
+const createColoredIcon = (color: string, badge?: string | number) => {
+  const badgeText = badge ?? '';
   return L.divIcon({
     className: 'custom-marker',
     html: `
@@ -45,7 +54,7 @@ const createColoredIcon = (color: string, number?: number) => {
           color: white;
           font-weight: bold;
           font-size: 14px;
-        ">${number || ''}</span>
+        ">${badgeText}</span>
       </div>
     `,
     iconSize: [32, 32],
@@ -60,12 +69,14 @@ export const InteractiveMap: React.FC<MapPickerProps> = ({
   onLocationSelect,
   markers = [],
   showRoute = false,
+  routeColor = '#2563EB',
+  routes = [],
   height = '400px',
 }) => {
   const mapRef = useRef<HTMLDivElement>(null);
   const mapInstanceRef = useRef<L.Map | null>(null);
   const markersRef = useRef<L.Marker[]>([]);
-  const polylineRef = useRef<L.Polyline | null>(null);
+  const polylinesRef = useRef<L.Polyline[]>([]);
 
   useEffect(() => {
     if (!mapRef.current || mapInstanceRef.current) return;
@@ -112,7 +123,7 @@ export const InteractiveMap: React.FC<MapPickerProps> = ({
     // Add new markers
     markers.forEach((markerData, index) => {
       const marker = L.marker(markerData.position, {
-        icon: createColoredIcon(markerData.color || '#2563EB', index + 1),
+        icon: createColoredIcon(markerData.color || '#2563EB', markerData.badge ?? index + 1),
       }).addTo(mapInstanceRef.current!);
 
       marker.bindPopup(`
@@ -128,29 +139,44 @@ export const InteractiveMap: React.FC<MapPickerProps> = ({
     });
   }, [markers]);
 
-  // Update route line
+  // Update route line(s)
   useEffect(() => {
     if (!mapInstanceRef.current) return;
 
-    // Remove old polyline
-    if (polylineRef.current) {
-      polylineRef.current.remove();
-      polylineRef.current = null;
+    // Remove old polylines
+    polylinesRef.current.forEach((polyline) => polyline.remove());
+    polylinesRef.current = [];
+
+    // Draw provided route paths first (real street geometry)
+    if (routes.length > 0) {
+      routes.forEach((route, idx) => {
+        if (!route.points || route.points.length < 2) return;
+
+        const polyline = L.polyline(route.points as L.LatLngExpression[], {
+          color: route.color || routeColor,
+          weight: route.weight ?? 4,
+          opacity: route.opacity ?? 0.85,
+        }).addTo(mapInstanceRef.current!);
+
+        polylinesRef.current.push(polyline);
+      });
+
+      return;
     }
 
-    // Add new polyline if needed
+    // Fallback straight line using marker sequence
     if (showRoute && markers.length > 1) {
       const positions = markers.map(m => m.position as L.LatLngExpression);
       const polyline = L.polyline(positions, {
-        color: '#2563EB',
+        color: routeColor,
         weight: 4,
         opacity: 0.7,
         dashArray: '10, 10',
       }).addTo(mapInstanceRef.current);
-      
-      polylineRef.current = polyline;
+
+      polylinesRef.current.push(polyline);
     }
-  }, [markers, showRoute]);
+  }, [markers, showRoute, routeColor, routes]);
 
   return (
     <div 

@@ -18,6 +18,9 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 
 @router.post("/register", response_model=AuthResponse, status_code=status.HTTP_201_CREATED)
 def register(payload: RegisterRequest):
+    if payload.role.value == "Driver":
+        raise HTTPException(status_code=400, detail="Driver signup is disabled for now")
+
     existing = (
         supabase.table("users")
         .select("user_id,email")
@@ -44,6 +47,19 @@ def register(payload: RegisterRequest):
 
     user = created.data[0]
     user_id = str(user["user_id"])
+
+    # Keep role-specific profile tables in sync with users.
+    if user.get("role") == "Employee":
+        employee_created = (
+            supabase.table("employee")
+            .insert({"user_id": user["user_id"]})
+            .execute()
+        )
+
+        if not employee_created.data:
+            # Best-effort rollback to avoid orphaned user records.
+            supabase.table("users").delete().eq("user_id", user["user_id"]).execute()
+            raise HTTPException(status_code=500, detail="Failed to create employee profile")
 
     tokens = TokenResponse(
         access_token=create_access_token(user_id),

@@ -8,6 +8,7 @@ import { Label } from '../ui/label';
 import { TimePicker } from '../ui/time-picker';
 import { InteractiveMap } from '../shared/InteractiveMap';
 import { useAuth } from '../../context/AuthContext';
+import { dropoffRequestApi } from '../../services/transportApi';
 
 export const DropoffRequestForm: React.FC = () => {
   const { user } = useAuth();
@@ -40,13 +41,20 @@ export const DropoffRequestForm: React.FC = () => {
     }));
   };
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setIsSubmitting(true);
-    setTimeout(() => {
+
+    await dropoffRequestApi.submit({
+      employeeId: user?.id ?? '1',
+      latitude: formData.latitude,
+      longitude: formData.longitude,
+      shiftEndTime: formData.shiftEndTime,
+      serviceDate: formData.serviceDate,
+    });
+
       setSubmitted(true);
       setIsSubmitting(false);
-    }, 2000);
   };
 
   const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {

@@ -5,7 +5,7 @@ export interface User {
   name: string;
   email: string;
   phone: string;
-  role: 'employee' | 'driver';
+  role: 'employee' | 'driver' | 'admin';
   address?: string;
   latitude?: number;
   longitude?: number;
