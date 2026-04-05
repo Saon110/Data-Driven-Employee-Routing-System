@@ -1,0 +1,32 @@
+services:
+  - type: web
+    name: dders-backend
+    env: docker
+    dockerContext: ./backend
+    dockerfilePath: ./backend/Dockerfile
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false
+      - key: JWT_SECRET_KEY
+        sync: false
+      - key: JWT_ALGORITHM
+        value: HS256
+      - key: ACCESS_TOKEN_EXPIRE_MINUTES
+        value: "30"
+      - key: REFRESH_TOKEN_EXPIRE_DAYS
+        value: "7"
+
+  - type: web
+    name: dders-frontend
+    env: docker
+    dockerContext: ./Frontend
+    dockerfilePath: ./Frontend/Dockerfile
+    plan: free
+    envVars:
+      # Set this to your backend Render URL after first deploy, e.g. https://dders-backend.onrender.com
+      - key: BACKEND_URL
+        sync: false
