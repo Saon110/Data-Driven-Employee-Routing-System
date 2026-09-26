@@ -13,21 +13,22 @@ from app.services.week_service import OFFICE_LOCATION
 # route's start. Single source of truth lives in week_service.
 OFFICE = (OFFICE_LOCATION["lat"], OFFICE_LOCATION["lng"])
 
-# BDS: employees walk to a designated pick-up point only if the foot-network
-# walk is within this many minutes; past it the 10 PM car comes to the door.
-WALK_LIMIT_MIN = 20
+# Case A (22:00) always places a rider at the nearest designated stop of their
+# car (no ad-hoc door stops); this limit now only decides serving order -- riders
+# with fewer stops within this walk are placed first.
+WALK_LIMIT_MIN = 30
 
 # Straight-line walk speed, used ONLY when the OSRM foot engine is unavailable.
 WALK_SPEED_KMPH = 4.5
 
 # BDS: a vehicle waits at most 5 minutes per stop for boarding/alighting.
-BOARDING_BUFFER_MIN = 5
+BOARDING_BUFFER_MIN = 1
 
 # Hard cap on a single route's on-road (passenger-journey) time.
 MAX_ROUTE_MINUTES = 120
 
 # A pickup must reach the office at least this early before the shift starts.
-OFFICE_BUFFER_MIN = 5
+OFFICE_BUFFER_MIN = 3
 
 # How much a drop-off ORDER cares about where the night ENDS. A drop-off tour
 # is open -- the car drops its last rider and stops -- so the leg home is
@@ -72,3 +73,19 @@ class SolverConfig:
     # can honour the rule. Set False to reproduce the notebook byte-for-byte on
     # a Friday service date.
     apply_friday_exception: bool = True
+
+    # Case B (door-to-door fallback): a car within `near_tie_slack` x the
+    # nearest car's distance (or within `near_tie_km_allowance` km of it,
+    # whichever is more permissive) is treated as an equally-good choice; ties
+    # then prefer a car already carrying riders, then the rider's own zone.
+    near_tie_slack: float = 1.25
+    near_tie_km_allowance: float = 1.0
+
+    # Case B-kmeans (23:00-06:00): capacity-constrained k-means over rider
+    # homes. `cluster_zone_penalty_km` discourages (but does not forbid)
+    # matching a cluster to a car outside its modal zone; `cluster_restarts`
+    # trades solve time for better (lower-SSE) clusters; `cluster_seed` is
+    # fixed so two runs over the same data agree.
+    cluster_zone_penalty_km: float = 5.0
+    cluster_restarts: int = 12
+    cluster_seed: int = 0

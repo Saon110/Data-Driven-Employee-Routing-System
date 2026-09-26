@@ -10,9 +10,13 @@ solver shape, preserving every behavioural decision:
   carries forward across the whole night, so a car starts from where it
   actually is. A drop-off tour ends at the LAST STOP, not the office.
 - **Case A (22:00)**: fixed-route matching against the roster's stops, walking
-  times from the OSRM foot network (≤ `walk_limit_min`), ad-hoc door stops for
-  riders with no reachable stop, then `redistribute_case_a` for cap shedding.
-- **Case B (23:00)**: greedy nearest-car door-to-door with a near-tie slack.
+  times from the OSRM foot network; every rider is placed at the nearest
+  designated stop (no ad-hoc door stops), then `redistribute_case_a` for cap
+  shedding.
+- **Case B (23:00)**: capacity-constrained k-means over rider homes (same
+  machinery as the overnight shifts); clusters are matched to the shift's
+  designated cars first, then same-zone cars, then cars at the office, then any
+  remaining free car from another zone.
 - **Case B-kmeans (00:00–06:00)**: capacity-constrained k-means over rider
   homes, exact cluster→car matching, `_spill_riders` safety net.
 - **Exact fair ordering** (Held-Karp) for pickups (minimise total passenger
@@ -28,7 +32,7 @@ solver shape, preserving every behavioural decision:
   car's free window) by dropping whole stops.
 
 ML travel-time model: leg durations used for ordering and timing come from the
-trained XGBoost bundle (`ml_model/inference_bundle.joblib`) instead of raw
+trained XGBoost bundle (`ml_model/inference_bundle_Retrained_V1.joblib`) instead of raw
 OSRM durations, exactly as the previous port did. Distance and geometry are
 unaffected — they still come from the injected `DistanceProvider`. Set
 `use_ml=False` to reproduce the notebook byte-for-byte with raw OSRM durations
@@ -76,6 +80,7 @@ from app.services.routing.distance import (
     haversine_km,
 )
 
+
 logger = logging.getLogger("uvicorn.error")
 
 Coord = Tuple[float, float]
@@ -84,24 +89,41 @@ Coord = Tuple[float, float]
 # why BDS exempts that day from the Agargaon Metro consolidation.
 _FRIDAY = 4
 
-# Case B-kmeans applies to these pick-up shifts; 11 PM stays on the greedy loop.
+# P5: 01:00-06:00 pickup keeps the original shared clustering, unchanged.
 KMEANS_PICKUP_SHIFTS = frozenset({
-    "00:00:00", "01:00:00", "02:00:00", "03:00:00",
+    "01:00:00", "02:00:00", "03:00:00",
     "04:00:00", "05:00:00", "06:00:00",
 })
+
+# P1: 23:00 pickup -- SSE fit against the 23:00 fixed routes, then office-car
+# cluster fallback.  P3: 00:00 pickup -- per-zone clustering, k = zone cars.
+PICKUP_SSE_EVENT = "23:00:00"
+PICKUP_PERZONE_EVENT = "00:00:00"
 
 # The evening drop-offs are fitted against each car's own fixed route by
 # least-squares (Hungarian), not by the reuse/tier rule.
 EVENING_FIT_EVENTS = frozenset({"22:15:00", "23:15:00"})
 
-# k-means constants (fixed seed: two runs over one data set must agree).
-CLUSTER_ZONE_PENALTY_KM = 5.0
-CLUSTER_RESTARTS = 12
-CLUSTER_SEED = 0
+# P6 REVERTED: 06:15 keeps the original non-evening reuse/tier path, so only
+# 22:15 uses the plain zone-strict SSE fit here.
+PLAIN_SSE_DROPOFF_EVENTS = frozenset({"22:15:00"})
+
+# P2/P4: 23:15 and 00:15 -- office cars first by SSE, then last-stop cars that
+# can still reach the office by the departure time.
+OFFICE_FIRST_FIT_EVENTS = frozenset({"23:15:00", "00:15:00"})
+
+# k-means tuning now lives on SolverConfig (near_tie_slack, near_tie_km_allowance,
+# cluster_zone_penalty_km, cluster_restarts, cluster_seed) so a sweep can override
+# them per run instead of editing this file.
 
 # Evening-fit prices: no roster curve (usable but last), and a dummy seat.
 _NO_CURVE_COST = 1.0e6
 _UNSEATABLE_COST = 1.0e9
+
+# Case B-kmeans (23:00): a car's preference tier dominates distance, so the
+# matcher fills the shift's designated cars first, then same-zone cars, then
+# cars sitting at the office, then any remaining free car from another zone.
+_TIER_WEIGHT = 1.0e6
 
 # Case D (07:30) geography — the Mirpur / Uttara boundary, fixed as plain
 # constants (no OSM dependency at runtime).
@@ -124,7 +146,10 @@ UTTARA_QUAD = [(90.3725, 23.8943), (90.4022, 23.8931),
 # self-contained since that project lives outside this backend package.
 
 _ML_BUNDLE_ENV_VAR = "ROUTING_ML_MODEL_PATH"
-_ML_BUNDLE_DEFAULT_PATH = Path(__file__).resolve().parent / "ml_model" / "inference_bundle.joblib"
+# The retrained bundle ships next to this module. `_ml_feature_row` reads both
+# bundle schemas, so the original `inference_bundle.joblib` can still be selected
+# through ROUTING_ML_MODEL_PATH.
+_ML_BUNDLE_DEFAULT_PATH = Path(__file__).resolve().parent / "ml_model" / "inference_bundle_Retrained_V1.joblib"
 
 _ml_bundle_cache: Optional[Dict[str, Any]] = None
 
@@ -199,16 +224,23 @@ def _ml_feature_row(
     bucket = _ml_traffic_bucket(hour)
     is_holiday = (query_time.month, query_time.day) in _ML_FIXED_HOLIDAYS_MD
 
+    # Historical speed lookup. Two bundle schemas exist: the original uses
+    # value/count columns named `mean`/`count` and a `global_mean`; the
+    # retrained bundle uses `speed`/`n_trips` and a `global_speed`. Read either
+    # so the same solver runs against both without edits.
     lvl1, lvl2, lvl3 = bundle["lvl1"], bundle["lvl2"], bundle["lvl3"]
+    _val = "speed" if "speed" in lvl1.columns else "mean"
+    _cnt = "n_trips" if "n_trips" in lvl1.columns else "count"
+    _glob = bundle["global_speed"] if "global_speed" in bundle else bundle["global_mean"]
     key1 = (od_zone_pair_id, bucket)
-    if key1 in lvl1.index and lvl1.loc[key1, "count"] >= bundle["min_support"]:
-        historical_avg_speed_kmh = lvl1.loc[key1, "mean"]
-    elif od_zone_pair_id in lvl2.index and lvl2.loc[od_zone_pair_id, "count"] >= bundle["min_support"]:
-        historical_avg_speed_kmh = lvl2.loc[od_zone_pair_id, "mean"]
-    elif bucket in lvl3.index and lvl3.loc[bucket, "count"] >= bundle["min_support"]:
-        historical_avg_speed_kmh = lvl3.loc[bucket, "mean"]
+    if key1 in lvl1.index and lvl1.loc[key1, _cnt] >= bundle["min_support"]:
+        historical_avg_speed_kmh = lvl1.loc[key1, _val]
+    elif od_zone_pair_id in lvl2.index and lvl2.loc[od_zone_pair_id, _cnt] >= bundle["min_support"]:
+        historical_avg_speed_kmh = lvl2.loc[od_zone_pair_id, _val]
+    elif bucket in lvl3.index and lvl3.loc[bucket, _cnt] >= bundle["min_support"]:
+        historical_avg_speed_kmh = lvl3.loc[bucket, _val]
     else:
-        historical_avg_speed_kmh = bundle["global_mean"]
+        historical_avg_speed_kmh = _glob
 
     return {
         "src_zone_id": src_zone_id, "dst_zone_id": dst_zone_id, "od_zone_pair_id": od_zone_pair_id,
@@ -224,8 +256,30 @@ def _ml_feature_row(
     }
 
 
+_ML_MODEL_KIND = "xgb"
+
+
+def _ml_onehot_frame(frame: pd.DataFrame, bundle: Dict[str, Any]) -> pd.DataFrame:
+    """Expand the 5 raw categorical columns into the one-hot matrix `rf_model`
+    was trained on (the 146 columns in `bundle["onehot_columns"]`)."""
+    cat_cols = bundle["categorical_cols"]
+    data: Dict[str, Any] = {}
+    for c in frame.columns:
+        if c not in cat_cols and c in bundle["onehot_columns"]:
+            data[c] = frame[c].astype(float)
+    for c in cat_cols:
+        vals = frame[c].astype(str)
+        for col in bundle["onehot_columns"]:
+            if col.startswith(c + "_"):
+                data[col] = (vals == col[len(c) + 1:]).astype(int)
+    out = pd.DataFrame(data, index=frame.index)
+    return out.reindex(columns=bundle["onehot_columns"], fill_value=0)
+
+
 def _ml_predict_minutes_batch(rows: List[Dict[str, Any]], bundle: Dict[str, Any]) -> List[float]:
-    """Batched XGBoost prediction: one `.predict()` call for every leg in a matrix."""
+    """Batched prediction: one `.predict()` call for every leg in a matrix.
+    Uses `xgb_model` on the raw categorical frame, or `rf_model` on the
+    one-hot design matrix, depending on `_ML_MODEL_KIND`."""
     if not rows:
         return []
     frame = pd.DataFrame(rows)
@@ -233,8 +287,11 @@ def _ml_predict_minutes_batch(rows: List[Dict[str, Any]], bundle: Dict[str, Any]
         frame[c] = pd.Categorical(frame[c].astype(str), categories=bundle["cat_categories"][c])
     for c in ["is_friday", "is_saturday", "is_weekend", "is_holiday", "rush_hour_flag"]:
         frame[c] = frame[c].astype(int)
-    frame = frame[bundle["feature_cols"]]
-    pred_seconds = np.exp(bundle["xgb_model"].predict(frame))
+    if _ML_MODEL_KIND == "rf":
+        design = _ml_onehot_frame(frame, bundle)
+        pred_seconds = np.exp(bundle["rf_model"].predict(design))
+    else:
+        pred_seconds = np.exp(bundle["xgb_model"].predict(frame[bundle["feature_cols"]]))
     return [float(s) / 60.0 for s in pred_seconds]
 
 
@@ -253,6 +310,7 @@ class _MlDurationProvider:
         self.inner = inner
         self.query_time: Optional[datetime] = None
         self.bundle = _load_ml_bundle()
+        self.name = f"{_ML_MODEL_KIND}_ml"
 
     def table(self, coords: Sequence[Coord]):
         raw_durations, distances = self.inner.table(coords)
@@ -483,7 +541,23 @@ class NightSolver:
     # ── timeline ─────────────────────────────────────────────────────────────
 
     def _build_timeline(self) -> None:
-        """One chronological timeline, GROUPED by shift (one event per shift).
+        """One CHRONOLOGICAL timeline, GROUPED by shift (one event per shift).
+
+        Events are ordered by the moment the fleet must be ready for them, not
+        by the nominal label:
+
+          - pickup : `shift_start - office_buffer_min` -- a pickup is planned
+                     BACKWARD from this office-arrival deadline, so its cars
+                     must be free well before it. This is the same instant
+                     `_run_pickup_event` passes to `_update_fleet`.
+          - dropoff: `drop_time` -- the car leaves the office at the drop time.
+
+        Ordering by this "ready-by" instant (stored as `deadline`) makes the
+        whole night chronological: an event that needs its cars earlier is
+        processed earlier, so it claims them before a later event can. The
+        canonical case is the 06:00 pickup (ready by 05:57) vs the 06:00
+        drop-off (office departure 06:15): the pickup now comes first and keeps
+        its designated cars, instead of being starved by the drop-off.
 
         Requests without coordinates are excluded here and reported as
         `no_coordinates` — they must never reach the geometry.
@@ -495,7 +569,14 @@ class NightSolver:
             pickup_by_shift.setdefault(normalise_clock(pr["shift_start_time"]), []).append(pr)
         for shift_time, reqs in pickup_by_shift.items():
             self.events.append(
-                {"type": "pickup", "time": shift_time, "shift_time": shift_time, "requests": reqs}
+                {
+                    "type": "pickup",
+                    "time": shift_time,
+                    "shift_time": shift_time,
+                    "requests": reqs,
+                    "deadline": self._parse_time(shift_time)
+                    - timedelta(minutes=self.cfg.office_buffer_min),
+                }
             )
 
         dropoff_by_shift: Dict[str, List[Dict[str, Any]]] = {}
@@ -523,11 +604,17 @@ class NightSolver:
                         "time": drop_time,             # scheduled drop time
                         "shift_time": shift_end_time,  # office departure label
                         "requests": group,
+                        "deadline": self._parse_time(drop_time),
                     }
                 )
 
-        # _parse_time is night-anchored, so this sorts correctly across midnight.
-        self.events.sort(key=lambda e: (self._parse_time(e["time"]), e["time"], e["shift_time"]))
+        # Chronological: order by the instant the fleet must be ready. `type` is
+        # only a deterministic tie-break for two events with the SAME deadline
+        # (pickup before dropoff: a pickup's deadline is hard, a drop-off's can
+        # slip). The label time and shift end make the order total and stable.
+        self.events.sort(
+            key=lambda e: (e["deadline"], e["time"], e["shift_time"], e["type"])
+        )
 
     def _report_missing_coordinates(self) -> None:
         for pr in self.pickup_requests:
@@ -706,11 +793,11 @@ class NightSolver:
     def _place_on(self, v, pr, home, route_by_car):
         """(stop_key, stop_item) for putting `pr` on car `v` — WITHOUT mutating v.
 
-        The nearest stop of THAT car's own fixed route within the walk limit,
-        else an ad-hoc stop at the door. A stop keeps its identity across
-        riders — keyed by its roster name, so everyone walking to a stop shares
-        it. An ad-hoc stop carries `_rank` as the fallback order for when the
-        exact placement (`_case_a_order`) cannot run.
+        The nearest stop of THAT car's own designated route. Riders are never
+        given an ad-hoc door stop — the car only ever stops at roster stops — so
+        a rider beyond the walk limit simply walks to the closest designated
+        stop. A stop keeps its identity across riders, keyed by its roster name,
+        so everyone walking to the same stop shares it.
         """
         route = route_by_car.get(v["plate_no"])
         if not route:
@@ -718,22 +805,13 @@ class NightSolver:
         best = None
         for i, s in enumerate(route):
             w = self.foot.walk_minutes(home, (s["pickup_lat"], s["pickup_lng"]))
-            if w <= self.cfg.walk_limit_min and (best is None or w < best[0]):
+            if best is None or w < best[0]:
                 best = (w, i, s)
-        if best is not None:
-            _, i, s = best
-            return s["location_name"], {
-                "coord": (s["pickup_lat"], s["pickup_lng"]),
-                "name": s["location_name"], "is_adhoc": False,
-                "_rank": (i, 0, 0.0), "passengers": [pr]}
-        anchor, anchor_km = 0, None
-        for i, s in enumerate(route):
-            km = haversine_km(home, (s["pickup_lat"], s["pickup_lng"]))
-            if anchor_km is None or km < anchor_km:
-                anchor, anchor_km = i, km
-        return f"adhoc_{pr['employee_email']}", {
-            "coord": home, "name": f"Ad-hoc ({self._employee_name(pr['employee_email'])})",
-            "is_adhoc": True, "_rank": (anchor, 1, anchor_km), "passengers": [pr]}
+        _, i, s = best
+        return s["location_name"], {
+            "coord": (s["pickup_lat"], s["pickup_lng"]),
+            "name": s["location_name"], "is_adhoc": False,
+            "_rank": (i, 0, 0.0), "passengers": [pr]}
 
     def _add_to(self, v, pr, home, route_by_car) -> bool:
         """Put `pr` on `v` in place. False if `v` has no route to put them on."""
@@ -766,6 +844,22 @@ class NightSolver:
 
         requests_this_shift = event["requests"]
         unassigned: List[Dict[str, Any]] = []
+
+        # --- P1 (23:00): SSE fit against the 23:00 fixed routes, then an
+        #     office-car cluster fallback for any riders it leaves behind. ---
+        if shift_time == PICKUP_SSE_EVENT:
+            return self._assign_pickup_sse(free_cars, requests_this_shift,
+                                           shift_time, roster_plates)
+
+        # --- P3 (00:00): per-zone clustering, k = available cars in the zone. ---
+        if shift_time == PICKUP_PERZONE_EVENT:
+            return self._assign_pickup_perzone(free_cars, requests_this_shift,
+                                               shift_time, roster_plates)
+
+        # --- Case B-kmeans (01:00-06:00, P5): unchanged shared clustering. ---
+        if shift_time in KMEANS_PICKUP_SHIFTS:
+            return self._assign_pickup_clustered(free_cars, requests_this_shift,
+                                                 shift_time, roster_plates)
 
         # --- Case A (10 PM only): the roster's own operation (Algorithm 1) ---
         if shift_time == "22:00:00":
@@ -841,12 +935,9 @@ class NightSolver:
                     unassigned.append(pr)
             return free_cars, unassigned
 
-        # --- Case B-kmeans (12 AM - 6 AM): cluster the riders, then match cars ---
-        if shift_time in KMEANS_PICKUP_SHIFTS:
-            return self._assign_pickup_clustered(free_cars, requests_this_shift,
-                                                 shift_time, roster_plates)
-
-        # --- Case B (11 PM): door-to-door — one greedy nearest-car pass ---
+        # --- Case B (fallback): door-to-door — one greedy nearest-car pass ---
+        # (23:00 and 00:00 are handled above; this catches only shift times
+        #  outside the Case A / SSE / k-means sets.)
         pending = sorted(requests_this_shift,
                          key=lambda pr: min(haversine_km((pr["pickup_lat"], pr["pickup_lng"]),
                                                v["current_location"]) for v in free_cars))
@@ -857,12 +948,11 @@ class NightSolver:
             if not with_room:
                 unassigned.append(pr)
                 continue
-            NEAR_TIE_SLACK = 1.25
             pool = [x for x in with_room if x["plate_no"] in roster_plates] or with_room
             dists = {x["plate_no"]: haversine_km(home, x["current_location"]) for x in pool}
             best = min(dists.values())
-            near = [x for x in pool if dists[x["plate_no"]] <= max(best * NEAR_TIE_SLACK,
-                                                                   best + 1.0)]
+            near = [x for x in pool if dists[x["plate_no"]] <= max(
+                best * self.cfg.near_tie_slack, best + self.cfg.near_tie_km_allowance)]
             v = min(near, key=lambda x: (0 if x["_stops"] else 1,
                                          dists[x["plate_no"]],
                                          0 if x["zone_name"] == zone else 1))
@@ -872,6 +962,136 @@ class NightSolver:
                 "is_adhoc": True, "passengers": [],
             })["passengers"].append(pr)
             v["_remaining"] -= 1
+        return free_cars, unassigned
+
+    def _sse_match(self, riders, pool, curve_of, free_of):
+        """Exact minimum-SSE, capacity-constrained rider -> car matching.
+
+        `curve_of(v)` returns the car's fitting curve (list of coords) or None;
+        `free_of(v)` returns the car's remaining seats. Returns (placed, left),
+        with `placed` = {plate: (car, [rider, ...])}.
+        """
+        slots = []
+        for v in pool:
+            slots.extend([v] * max(0, free_of(v)))
+        if not riders or not slots:
+            return {}, list(riders)
+        n, m = len(riders), len(slots)
+        size = max(n, m)
+        cost = [[0.0] * size for _ in range(size)]
+        for i, r in enumerate(riders):
+            home = (r["pickup_lat"], r["pickup_lng"])
+            for j, v in enumerate(slots):
+                curve = curve_of(v)
+                cost[i][j] = _NO_CURVE_COST if not curve else self._sse_residual(home, curve)
+        for j in range(m, size):
+            for i in range(n):
+                cost[i][j] = _UNSEATABLE_COST
+        rows, cols = linear_sum_assignment(cost)
+        placed: Dict[str, Tuple[Any, List]] = {}
+        left = []
+        for i, j in zip(rows, cols):
+            if i >= n:
+                continue
+            if j >= m or cost[i][j] >= _UNSEATABLE_COST:
+                left.append(riders[i])
+                continue
+            v = slots[j]
+            placed.setdefault(v["plate_no"], (v, []))[1].append(riders[i])
+        return placed, left
+
+    def _assign_pickup_sse(self, free_cars, requests, shift_time, roster_plates):
+        """P1: 23:00 pickup.
+
+        Phase 1 -- SSE fit: assign riders to the cars that have a 23:00 fixed
+        route, minimising the total squared distance from each home to the
+        nearest stop of that car's route; then place each rider at that nearest
+        fixed stop.
+        Phase 2 -- office-car clustering: cluster the leftover riders and match
+        the clusters to the cars sitting at the office (door stops). Phase 3
+        (splitting a cluster that breaks the cap) is the k-sweep inside
+        `_assign_pickup_clustered`.
+        """
+        curves = {}
+        for v in free_cars:
+            route = self._route_by_car_shift.get((v["plate_no"], shift_time))
+            if route:
+                curves[v["plate_no"]] = [(s["pickup_lat"], s["pickup_lng"]) for s in route]
+        pool = [v for v in free_cars if v["plate_no"] in curves]
+
+        placed, left = self._sse_match(
+            requests, pool,
+            curve_of=lambda v: curves.get(v["plate_no"]),
+            free_of=lambda v: v["_remaining"])
+
+        for v, emps in placed.values():
+            route = self._route_by_car_shift[(v["plate_no"], shift_time)]
+            for pr in emps:
+                home = (pr["pickup_lat"], pr["pickup_lng"])
+                i, s = min(
+                    enumerate(route),
+                    key=lambda kv: haversine_km(home, (kv[1]["pickup_lat"], kv[1]["pickup_lng"])))
+                key = s["location_name"]
+                v["_stops"].setdefault(key, {
+                    "coord": (s["pickup_lat"], s["pickup_lng"]),
+                    "name": s["location_name"], "is_adhoc": False,
+                    "_rank": (i, 0, 0.0), "passengers": []})["passengers"].append(pr)
+                v["_remaining"] -= 1
+
+        unassigned = list(left)
+        if unassigned:
+            office_cars = [v for v in free_cars
+                           if v["current_location"] == self.office and v["_remaining"] > 0]
+            if office_cars:
+                _vcars, still = self._assign_pickup_clustered(
+                    office_cars, unassigned, shift_time, roster_plates)
+                unassigned = still
+        return free_cars, unassigned
+
+    def _assign_pickup_perzone(self, free_cars, requests, shift_time, roster_plates):
+        """P3: 00:00 pickup -- per-zone clustering with k = zone cars.
+
+        For each zone, cluster that zone's riders into k = (number of AVAILABLE
+        cars in the zone) clusters and match the clusters to those cars. Riders
+        left over are re-clustered onto the cars at the office / other zones.
+        """
+        by_zone: Dict[Optional[str], List] = {}
+        for r in requests:
+            by_zone.setdefault(r.get("zone_name"), []).append(r)
+
+        unassigned: List = []
+        used = set()
+        for zone, emps in by_zone.items():
+            cars = [v for v in free_cars if v["zone_name"] == zone and v["_remaining"] > 0]
+            if not cars:
+                office = [v for v in free_cars
+                          if v["current_location"] == self.office and v["_remaining"] > 0]
+                cars = office or [v for v in free_cars if v["_remaining"] > 0]
+            if not cars:
+                unassigned.extend(emps)
+                continue
+            k = len(cars)
+            homes = [(r["pickup_lat"], r["pickup_lng"]) for r in emps]
+            rzones = [r.get("zone_name") for r in emps]
+            cap = max(1, max(v["_remaining"] for v in cars), math.ceil(len(emps) / k))
+            clusters = self._kmeans_riders(homes, k, cap)
+            got, _cost = self._match_clusters_to_cars(clusters, homes, rzones, cars)
+            if got is None:
+                got = cars[:len(clusters)]
+            placed_idx = set()
+            for cl, v in zip(clusters, got):
+                v["_stops"].update(self._cluster_stops(cl, emps, homes))
+                v["_remaining"] -= len(cl)
+                used.add(v["plate_no"])
+                placed_idx.update(cl)
+            unassigned.extend(emps[i] for i in range(len(emps)) if i not in placed_idx)
+
+        if unassigned:
+            spare = [v for v in free_cars
+                     if v["_remaining"] > 0 and v["plate_no"] not in used]
+            if spare:
+                _vcars, unassigned = self._assign_pickup_clustered(
+                    spare, unassigned, shift_time, roster_plates)
         return free_cars, unassigned
 
     def _order_stops_pickup(self, vehicle) -> List[Tuple[Any, Dict[str, Any]]]:
@@ -1193,15 +1413,15 @@ class NightSolver:
         """Capacity-constrained k-means over the riders' homes.
 
         Returns the rider indices of each cluster, taken from the tightest of
-        CLUSTER_RESTARTS seeded k-means++ starts. The seed is fixed on purpose.
+        `cfg.cluster_restarts` seeded k-means++ starts. The seed is fixed on purpose.
         """
         xy = self._cluster_xy(homes)
         n = len(xy)
         if k <= 1:
             return [list(range(n))] if n else []
         best, best_sse = None, None
-        for r in range(CLUSTER_RESTARTS):
-            rng = random.Random(CLUSTER_SEED * 9973 + r)
+        for r in range(self.cfg.cluster_restarts):
+            rng = random.Random(self.cfg.cluster_seed * 9973 + r)
             cents = [list(xy[rng.randrange(n)])]
             while len(cents) < k:
                 d2 = [min((x - cx) ** 2 + (y - cy) ** 2 for cx, cy in cents)
@@ -1237,8 +1457,13 @@ class NightSolver:
                 best = [[i for i, c in enumerate(who) if c == j] for j in range(k)]
         return [cl for cl in best if cl]
 
-    def _match_clusters_to_cars(self, clusters, homes, rzones, cars):
-        """Cheapest pairing of clusters to cars, or (None, None) if there is none."""
+    def _match_clusters_to_cars(self, clusters, homes, rzones, cars, tier_of=None):
+        """Cheapest pairing of clusters to cars, or (None, None) if there is none.
+
+        `tier_of(v, cluster_zone)` (optional) returns a car-preference tier that
+        is weighted by `_TIER_WEIGHT`, so the matcher drains lower tiers first
+        (23:00: designated cars, then same zone, then office, then the rest).
+        """
         k = len(clusters)
         cents = [(sum(homes[i][0] for i in cl) / len(cl),
                   sum(homes[i][1] for i in cl) / len(cl)) for cl in clusters]
@@ -1248,8 +1473,9 @@ class NightSolver:
             for v in cars:
                 if v["capacity"] < len(cl):
                     continue
-                pen = 0.0 if v["zone_name"] == czone[ci] else CLUSTER_ZONE_PENALTY_KM
-                cost[(ci, v["plate_no"])] = haversine_km(cents[ci], v["current_location"]) + pen
+                pen = 0.0 if v["zone_name"] == czone[ci] else self.cfg.cluster_zone_penalty_km
+                tier = _TIER_WEIGHT * tier_of(v, czone[ci]) if tier_of is not None else 0.0
+                cost[(ci, v["plate_no"])] = haversine_km(cents[ci], v["current_location"]) + pen + tier
         short_plates = set()
         for ci in range(k):
             for p in sorted((p for p in cost if p[0] == ci), key=lambda p: cost[p])[:k]:
@@ -1341,10 +1567,14 @@ class NightSolver:
 
     def _assign_pickup_clustered(self, free_cars, requests_this_shift, shift_time,
                                  roster_plates) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-        """12 AM - 6 AM pick-ups: cluster the riders, then match the clusters to cars.
+        """11 PM - 6 AM pick-ups: cluster the riders, then match the clusters to cars.
 
         k is swept upward from the fewest cars that can physically hold
         everyone, and the FIRST k whose routes clear both clocks wins.
+
+        For the 11 PM shift the car matcher is tiered: the shift's designated
+        cars are preferred, then same-zone cars, then cars already at the
+        office, then any remaining free car from another zone.
         """
         riders = list(requests_this_shift)
         n = len(riders)
@@ -1357,9 +1587,21 @@ class NightSolver:
         pools = [(label, p) for label, p in
                  ((f"rostered({len(rostered)})", rostered), ("anyone", free_cars)) if p]
 
+        tier_of = None
+        if shift_time == "23:00:00":
+            def tier_of(v, czone):
+                if v["plate_no"] in roster_plates:
+                    return 0                      # designated 11 PM car
+                if v["zone_name"] == czone:
+                    return 1                      # same zone as the cluster
+                if v["current_location"] == self.office:
+                    return 2                      # idle at the office
+                return 3                          # free car in another zone
+
         def _match(clusters):
             for label, pool in pools:
-                got, cost = self._match_clusters_to_cars(clusters, homes, rzones, pool)
+                got, cost = self._match_clusters_to_cars(clusters, homes, rzones, pool,
+                                                         tier_of=tier_of)
                 if got is not None:
                     return got, cost, label
             return None, None, None
@@ -1367,7 +1609,10 @@ class NightSolver:
         tries, chosen = [], None
         if n <= sum(caps):
             for k in range(max(1, math.ceil(n / caps[0])), min(len(free_cars), n) + 1):
-                clusters = self._kmeans_riders(homes, k, caps[k - 1])
+                # Per-cluster cap: never below the k-th largest car's capacity,
+                # but always large enough that k clusters can hold everyone.
+                cap = max(caps[k - 1], math.ceil(n / k))
+                clusters = self._kmeans_riders(homes, k, cap)
                 if not clusters:
                     continue
                 got, cost, label = _match(clusters)
@@ -1381,7 +1626,8 @@ class NightSolver:
                 chosen = (clusters, got, cost, label)
                 break
         if chosen is None:
-            clusters = self._kmeans_riders(homes, max(1, min(len(free_cars), n)), caps[0])
+            k = max(1, min(len(free_cars), n))
+            clusters = self._kmeans_riders(homes, k, max(caps[0], math.ceil(n / k)))
             got, cost, label = _match(clusters) if clusters else (None, None, None)
             if got is not None:
                 chosen = (clusters, got, cost, label)
@@ -1530,6 +1776,39 @@ class NightSolver:
 
         return assigned_vehicles, unassigned
 
+    def _assign_office_first(self, event, reachable) -> Tuple[List, List]:
+        """P2/P4: cars at the office take riders by SSE first; if riders remain,
+        the last-stop cars that can still reach the office by the drop time take
+        the rest. `reachable` already enforces the office-arrival deadline.
+        """
+        shift_end_time = event["shift_time"]
+
+        def eligible():
+            return [v for v in self.fleet.values()
+                    if v["plate_no"] in reachable and v["status"] == "AVAILABLE"
+                    and self._free_seats(v) > 0]
+
+        office = [v for v in eligible() if v["current_location"] == self.office]
+        laststop = [v for v in eligible() if v["current_location"] != self.office]
+
+        by_zone: Dict[Optional[str], List] = {}
+        for d in event["requests"]:
+            by_zone.setdefault(d.get("zone_name"), []).append(d)
+
+        assigned_vehicles, unassigned, spill = [], [], []
+        for zone, emps in by_zone.items():
+            cars = [v for v in office if zone is not None and v["zone_name"] == zone]
+            placed, left = self._sse_fit_assign(emps, cars, shift_end_time)
+            assigned_vehicles.extend(placed)
+            spill.extend(left)
+
+        if spill:
+            placed, left = self._sse_fit_assign(spill, laststop, shift_end_time,
+                                                allow_routeless=True)
+            assigned_vehicles.extend(placed)
+            unassigned.extend(left)
+        return assigned_vehicles, unassigned
+
     def _assign_capacity(self, v, emps, assigned_vehicles, unassigned, allow, reachable,
                          ref_plate) -> None:
         """Place `emps` on `v`, spilling any overflow onto other eligible cars."""
@@ -1634,7 +1913,11 @@ class NightSolver:
             return min(candidates, key=lambda x: (reachable[x["plate_no"]],
                                                   0 if x["zone_name"] == zone else 1))
 
-        if drop_time in EVENING_FIT_EVENTS:
+        if drop_time in OFFICE_FIRST_FIT_EVENTS:
+            # P2/P4 (23:15, 00:15): office cars first, then last-stop cars.
+            assigned_vehicles, unassigned = self._assign_office_first(event, reachable)
+        elif drop_time in PLAIN_SSE_DROPOFF_EVENTS:
+            # 22:15 and (P6) 06:15: the plain zone-strict SSE fit.
             assigned_vehicles, unassigned = self._assign_evening(event, reachable)
         else:
             groups: Dict[Optional[str], List[Dict[str, Any]]] = {}
