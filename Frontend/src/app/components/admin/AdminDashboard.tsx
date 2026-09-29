@@ -6,6 +6,7 @@ import {
   Bus, MapPin, Clock, AlertCircle,
   X, Edit, Phone, Mail, Hash, UserCog,
   BarChart3, Shield, CheckCircle, Sun, Moon,
+  UserPlus, Link2,
 } from 'lucide-react';
 import { useAuth } from '../../context/AuthContext';
 import { useTheme } from '../../context/ThemeContext';
@@ -342,6 +343,27 @@ export const AdminDashboard: React.FC = () => {
   const [newEmp, setNewEmp] = useState({ name: '', email: '', phone: '', password: '' });
   const [addSaving, setAddSaving] = useState(false);
 
+  // Add driver (driver-only, no vehicle)
+  const [addDriverOpen, setAddDriverOpen] = useState(false);
+  const [newDriver, setNewDriver] = useState({ name: '', email: '', phone: '', password: '', license_no: '' });
+  const [addDriverSaving, setAddDriverSaving] = useState(false);
+  const [addDriverError, setAddDriverError] = useState('');
+
+  // Add vehicle — combined fast path (new driver) is the default, but an
+  // existing unassigned driver or no driver at all are both still options.
+  const [addVehicleOpen, setAddVehicleOpen] = useState(false);
+  const [addVehicleSaving, setAddVehicleSaving] = useState(false);
+  const [addVehicleError, setAddVehicleError] = useState('');
+  const [newVehicle, setNewVehicle] = useState({ plate_no: '', capacity: '', status: 'Active' as string });
+  const [vehicleDriverMode, setVehicleDriverMode] = useState<'new' | 'existing' | 'none'>('new');
+  const [vehicleExistingDriverId, setVehicleExistingDriverId] = useState('');
+  const [vehicleNewDriver, setVehicleNewDriver] = useState({ name: '', email: '', phone: '', password: '', license_no: '' });
+
+  // Reassign driver on an existing vehicle
+  const [reassignVehicle, setReassignVehicle] = useState<Vehicle | null>(null);
+  const [reassignDriverId, setReassignDriverId] = useState('');
+  const [reassignSaving, setReassignSaving] = useState(false);
+
   const handleAddEmployee = async () => {
     if (!newEmp.name.trim() || !newEmp.email.trim() || !newEmp.password) return;
     if (newEmp.password.length < 6) {
@@ -364,6 +386,109 @@ export const AdminDashboard: React.FC = () => {
       setApiError(err instanceof Error ? err.message : 'Could not add employee.');
     } finally {
       setAddSaving(false);
+    }
+  };
+
+  const handleAddDriver = async () => {
+    if (!newDriver.name.trim() || !newDriver.email.trim() || !newDriver.password || !newDriver.license_no.trim()) return;
+    if (newDriver.password.length < 6) {
+      setAddDriverError('Password must be at least 6 characters.');
+      return;
+    }
+    setAddDriverSaving(true);
+    setAddDriverError('');
+    try {
+      await driverApi.create({
+        name: newDriver.name.trim(),
+        email: newDriver.email.trim(),
+        phone: newDriver.phone.trim() || undefined,
+        password: newDriver.password,
+        license_no: newDriver.license_no.trim(),
+      });
+      setNewDriver({ name: '', email: '', phone: '', password: '', license_no: '' });
+      setAddDriverOpen(false);
+      await loadAdminApiData();
+    } catch (err) {
+      setAddDriverError(err instanceof Error ? err.message : 'Could not add driver.');
+    } finally {
+      setAddDriverSaving(false);
+    }
+  };
+
+  /** Add a vehicle — and, by default, a brand-new driver for it in the same
+   * action, since the fleet is normally a 1:1 pairing. An existing
+   * unassigned driver, or no driver yet, are both still available. */
+  const handleAddVehicle = async () => {
+    const capacity = Number(newVehicle.capacity);
+    if (!newVehicle.plate_no.trim() || !capacity || capacity <= 0) {
+      setAddVehicleError('Plate number and a positive capacity are required.');
+      return;
+    }
+    if (vehicleDriverMode === 'new' && (!vehicleNewDriver.name.trim() || !vehicleNewDriver.email.trim() || !vehicleNewDriver.password || !vehicleNewDriver.license_no.trim())) {
+      setAddVehicleError('Fill in the new driver’s name, email, password, and license number.');
+      return;
+    }
+    if (vehicleDriverMode === 'new' && vehicleNewDriver.password.length < 6) {
+      setAddVehicleError('Driver password must be at least 6 characters.');
+      return;
+    }
+    if (vehicleDriverMode === 'existing' && !vehicleExistingDriverId) {
+      setAddVehicleError('Pick an existing driver, or switch to "No driver yet".');
+      return;
+    }
+
+    setAddVehicleSaving(true);
+    setAddVehicleError('');
+    try {
+      let driverId: number | undefined;
+      if (vehicleDriverMode === 'new') {
+        const created = await driverApi.create({
+          name: vehicleNewDriver.name.trim(),
+          email: vehicleNewDriver.email.trim(),
+          phone: vehicleNewDriver.phone.trim() || undefined,
+          password: vehicleNewDriver.password,
+          license_no: vehicleNewDriver.license_no.trim(),
+        });
+        driverId = created.driver_id;
+      } else if (vehicleDriverMode === 'existing') {
+        driverId = Number(vehicleExistingDriverId);
+      }
+
+      await vehicleApi.create({
+        plate_no: newVehicle.plate_no.trim(),
+        capacity,
+        status: newVehicle.status,
+        driver_id: driverId,
+      });
+
+      setNewVehicle({ plate_no: '', capacity: '', status: 'Active' });
+      setVehicleDriverMode('new');
+      setVehicleExistingDriverId('');
+      setVehicleNewDriver({ name: '', email: '', phone: '', password: '', license_no: '' });
+      setAddVehicleOpen(false);
+      await loadAdminApiData();
+    } catch (err) {
+      setAddVehicleError(err instanceof Error ? err.message : 'Could not add vehicle.');
+    } finally {
+      setAddVehicleSaving(false);
+    }
+  };
+
+  const handleReassignDriver = async () => {
+    if (!reassignVehicle) return;
+    setReassignSaving(true);
+    setApiError(null);
+    try {
+      await vehicleApi.update(reassignVehicle.vehicle_id, {
+        driver_id: reassignDriverId ? Number(reassignDriverId) : null,
+      });
+      setReassignVehicle(null);
+      setReassignDriverId('');
+      await loadAdminApiData();
+    } catch (err) {
+      setApiError(err instanceof Error ? err.message : 'Could not reassign driver.');
+    } finally {
+      setReassignSaving(false);
     }
   };
 
@@ -406,6 +531,10 @@ export const AdminDashboard: React.FC = () => {
     e.name.toLowerCase().includes(searchQ.toLowerCase()) ||
     e.email.toLowerCase().includes(searchQ.toLowerCase())
   );
+
+  // Drivers not currently linked to any vehicle — the pool offered when
+  // assigning an *existing* driver instead of creating a new one.
+  const unassignedDrivers = drivers.filter(d => !vehicles.some(v => v.driver_id === d.driver_id));
 
   const StatCard = ({ label, value, icon: Icon, color, sub }: any) => (
     <div className="rounded-xl border border-border bg-card p-5 flex items-center gap-4">
@@ -707,13 +836,22 @@ export const AdminDashboard: React.FC = () => {
           {/* ─── DRIVERS ─── */}
           {view === 'drivers' && (
             <div className="space-y-6">
-              <SectionHeader
-                icon={Truck}
-                iconColor="bg-emerald-50 dark:bg-emerald-500/15 text-emerald-600 dark:text-emerald-400"
-                title="Drivers"
-                subtitle="Fleet drivers and their vehicle assignments"
-                count={drivers.length}
-              />
+              <div className="flex items-center justify-between gap-4 flex-wrap">
+                <SectionHeader
+                  icon={Truck}
+                  iconColor="bg-emerald-50 dark:bg-emerald-500/15 text-emerald-600 dark:text-emerald-400"
+                  title="Drivers"
+                  subtitle="Fleet drivers and their vehicle assignments"
+                  count={drivers.length}
+                />
+                <button
+                  onClick={() => setAddDriverOpen(true)}
+                  className="flex items-center gap-2 px-4 py-2.5 rounded-lg bg-primary text-primary-foreground hover:opacity-90 text-sm font-semibold transition"
+                >
+                  <UserPlus className="w-4 h-4" />
+                  Add Driver
+                </button>
+              </div>
               {drivers.length === 0 ? (
                 <div className="rounded-xl border border-border bg-card text-center py-12 text-muted-foreground">No drivers found.</div>
               ) : (
@@ -775,13 +913,22 @@ export const AdminDashboard: React.FC = () => {
           {/* ─── VEHICLES ─── */}
           {view === 'vehicles' && (
             <div className="space-y-6">
-              <SectionHeader
-                icon={Car}
-                iconColor="bg-[#14B8A6]/15 text-[#14B8A6]"
-                title="Vehicles"
-                subtitle="Fleet vehicle roster and status"
-                count={vehicles.length}
-              />
+              <div className="flex items-center justify-between gap-4 flex-wrap">
+                <SectionHeader
+                  icon={Car}
+                  iconColor="bg-[#14B8A6]/15 text-[#14B8A6]"
+                  title="Vehicles"
+                  subtitle="Fleet vehicle roster and status"
+                  count={vehicles.length}
+                />
+                <button
+                  onClick={() => setAddVehicleOpen(true)}
+                  className="flex items-center gap-2 px-4 py-2.5 rounded-lg bg-primary text-primary-foreground hover:opacity-90 text-sm font-semibold transition"
+                >
+                  <Plus className="w-4 h-4" />
+                  Add Vehicle
+                </button>
+              </div>
               {vehicles.length === 0 ? (
                 <div className="rounded-xl border border-border bg-card text-center py-12 text-muted-foreground">No vehicles found.</div>
               ) : (
@@ -812,9 +959,19 @@ export const AdminDashboard: React.FC = () => {
                           </span>
                         </div>
 
-                        <div className="mt-4 pt-4 border-t border-border">
-                          <p className="text-[10px] uppercase tracking-wider text-muted-foreground font-semibold mb-1.5">Assigned Driver</p>
-                          <p className="text-sm text-foreground">{driver?.name || <span className="text-muted-foreground">Unassigned</span>}</p>
+                        <div className="mt-4 pt-4 border-t border-border flex items-end justify-between gap-3">
+                          <div className="min-w-0">
+                            <p className="text-[10px] uppercase tracking-wider text-muted-foreground font-semibold mb-1.5">Assigned Driver</p>
+                            <p className="text-sm text-foreground truncate">{driver?.name || <span className="text-muted-foreground">Unassigned</span>}</p>
+                          </div>
+                          <button
+                            onClick={() => { setReassignVehicle(v); setReassignDriverId(v.driver_id ? String(v.driver_id) : ''); }}
+                            className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium border border-border text-muted-foreground hover:text-foreground hover:border-foreground/20 transition flex-shrink-0"
+                            title={driver ? 'Reassign driver' : 'Assign a driver'}
+                          >
+                            <Link2 className="w-3.5 h-3.5" />
+                            {driver ? 'Reassign' : 'Assign'}
+                          </button>
                         </div>
                       </div>
                     );
@@ -1164,6 +1321,234 @@ export const AdminDashboard: React.FC = () => {
                 className="flex-1 py-2.5 rounded-lg bg-primary text-primary-foreground hover:opacity-90 font-semibold text-sm transition disabled:opacity-60"
               >
                 {addSaving ? 'Adding…' : 'Add Employee'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Add Driver Modal */}
+      {addDriverOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm">
+          <div className="w-full max-w-md rounded-2xl border border-border bg-card p-8 shadow-2xl">
+            <div className="flex items-center justify-between mb-6">
+              <h3 className="text-lg font-bold text-foreground" style={{ fontFamily: 'Rajdhani, sans-serif' }}>Add New Driver</h3>
+              <button onClick={() => setAddDriverOpen(false)} className="text-muted-foreground hover:text-foreground transition">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+            <div className="space-y-4">
+              {[
+                { label: 'Full Name', field: 'name', placeholder: 'e.g. Rasel Ahmed', type: 'text' },
+                { label: 'Email', field: 'email', placeholder: 'email@company.com', type: 'email' },
+                { label: 'Phone', field: 'phone', placeholder: '+880-17xx-xxxxxx', type: 'text' },
+                { label: 'License Number', field: 'license_no', placeholder: 'DL-XXXXXXXX', type: 'text' },
+                { label: 'Temporary Password', field: 'password', placeholder: 'Set initial password', type: 'password' },
+              ].map(({ label, field, placeholder, type }) => (
+                <div key={field}>
+                  <label className="block text-xs text-muted-foreground mb-1.5 uppercase tracking-wider">{label}</label>
+                  <input
+                    type={type}
+                    value={(newDriver as any)[field]}
+                    onChange={e => setNewDriver(prev => ({ ...prev, [field]: e.target.value }))}
+                    placeholder={placeholder}
+                    className="w-full px-3 py-2.5 rounded-lg border border-border bg-muted text-foreground placeholder:text-muted-foreground text-sm focus:outline-none focus:border-[#14B8A6]/50 transition"
+                  />
+                </div>
+              ))}
+            </div>
+            {addDriverError && <p className="text-xs text-red-600 dark:text-red-400 mt-3">{addDriverError}</p>}
+            <p className="text-xs text-muted-foreground mt-3">
+              This driver won't have a vehicle yet — assign one from the Vehicles tab whenever it's ready.
+            </p>
+            <div className="flex gap-3 mt-6">
+              <button onClick={() => setAddDriverOpen(false)} className="flex-1 py-2.5 rounded-lg border border-border text-muted-foreground hover:text-foreground hover:border-foreground/20 text-sm transition">
+                Cancel
+              </button>
+              <button
+                onClick={handleAddDriver}
+                disabled={addDriverSaving}
+                className="flex-1 py-2.5 rounded-lg bg-primary text-primary-foreground hover:opacity-90 font-semibold text-sm transition disabled:opacity-60"
+              >
+                {addDriverSaving ? 'Adding…' : 'Add Driver'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Add Vehicle Modal — the combined "vehicle + new driver" fast path is
+          the default, matching the fleet's normal 1:1 pairing, but an
+          existing unassigned driver or no driver at all stay one click away. */}
+      {addVehicleOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm overflow-y-auto py-8">
+          <div className="w-full max-w-lg rounded-2xl border border-border bg-card p-8 shadow-2xl my-auto">
+            <div className="flex items-center justify-between mb-6">
+              <h3 className="text-lg font-bold text-foreground" style={{ fontFamily: 'Rajdhani, sans-serif' }}>Add New Vehicle</h3>
+              <button onClick={() => setAddVehicleOpen(false)} className="text-muted-foreground hover:text-foreground transition">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="grid grid-cols-2 gap-4 mb-5">
+              <div>
+                <label className="block text-xs text-muted-foreground mb-1.5 uppercase tracking-wider">Plate Number</label>
+                <input
+                  type="text"
+                  value={newVehicle.plate_no}
+                  onChange={e => setNewVehicle(prev => ({ ...prev, plate_no: e.target.value }))}
+                  placeholder="Dhaka Metro Cha-11-2233"
+                  className="w-full px-3 py-2.5 rounded-lg border border-border bg-muted text-foreground placeholder:text-muted-foreground text-sm focus:outline-none focus:border-[#14B8A6]/50 transition"
+                />
+              </div>
+              <div>
+                <label className="block text-xs text-muted-foreground mb-1.5 uppercase tracking-wider">Capacity</label>
+                <input
+                  type="number"
+                  min={1}
+                  value={newVehicle.capacity}
+                  onChange={e => setNewVehicle(prev => ({ ...prev, capacity: e.target.value }))}
+                  placeholder="e.g. 20"
+                  className="w-full px-3 py-2.5 rounded-lg border border-border bg-muted text-foreground placeholder:text-muted-foreground text-sm focus:outline-none focus:border-[#14B8A6]/50 transition"
+                />
+              </div>
+            </div>
+
+            <div className="mb-5">
+              <label className="block text-xs text-muted-foreground mb-1.5 uppercase tracking-wider">Status</label>
+              <select
+                value={newVehicle.status}
+                onChange={e => setNewVehicle(prev => ({ ...prev, status: e.target.value }))}
+                className="w-full px-3 py-2.5 rounded-lg border border-border bg-muted text-foreground text-sm focus:outline-none focus:border-[#14B8A6]/50 transition"
+              >
+                <option value="Active">Active</option>
+                <option value="Maintenance">Maintenance</option>
+                <option value="Inactive">Inactive</option>
+              </select>
+            </div>
+
+            <div className="mb-5 pt-5 border-t border-border">
+              <p className="text-xs text-muted-foreground mb-2 uppercase tracking-wider">Driver</p>
+              <div className="flex items-center gap-1 p-1 rounded-lg bg-muted mb-4">
+                {([
+                  { id: 'new', label: 'New driver' },
+                  { id: 'existing', label: 'Existing driver' },
+                  { id: 'none', label: 'No driver yet' },
+                ] as const).map(opt => (
+                  <button
+                    key={opt.id}
+                    onClick={() => setVehicleDriverMode(opt.id)}
+                    className={`flex-1 py-2 rounded-md text-xs font-semibold transition ${
+                      vehicleDriverMode === opt.id ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:text-foreground'
+                    }`}
+                  >
+                    {opt.label}
+                  </button>
+                ))}
+              </div>
+
+              {vehicleDriverMode === 'new' && (
+                <div className="space-y-3">
+                  {[
+                    { label: 'Full Name', field: 'name', placeholder: 'e.g. Rasel Ahmed', type: 'text' },
+                    { label: 'Email', field: 'email', placeholder: 'email@company.com', type: 'email' },
+                    { label: 'Phone', field: 'phone', placeholder: '+880-17xx-xxxxxx', type: 'text' },
+                    { label: 'License Number', field: 'license_no', placeholder: 'DL-XXXXXXXX', type: 'text' },
+                    { label: 'Temporary Password', field: 'password', placeholder: 'Set initial password', type: 'password' },
+                  ].map(({ label, field, placeholder, type }) => (
+                    <div key={field}>
+                      <label className="block text-xs text-muted-foreground mb-1.5 uppercase tracking-wider">{label}</label>
+                      <input
+                        type={type}
+                        value={(vehicleNewDriver as any)[field]}
+                        onChange={e => setVehicleNewDriver(prev => ({ ...prev, [field]: e.target.value }))}
+                        placeholder={placeholder}
+                        className="w-full px-3 py-2.5 rounded-lg border border-border bg-muted text-foreground placeholder:text-muted-foreground text-sm focus:outline-none focus:border-[#14B8A6]/50 transition"
+                      />
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {vehicleDriverMode === 'existing' && (
+                unassignedDrivers.length === 0 ? (
+                  <p className="text-sm text-muted-foreground">No unassigned drivers right now — every driver already has a vehicle.</p>
+                ) : (
+                  <select
+                    value={vehicleExistingDriverId}
+                    onChange={e => setVehicleExistingDriverId(e.target.value)}
+                    className="w-full px-3 py-2.5 rounded-lg border border-border bg-muted text-foreground text-sm focus:outline-none focus:border-[#14B8A6]/50 transition"
+                  >
+                    <option value="">Select a driver…</option>
+                    {unassignedDrivers.map(d => (
+                      <option key={d.driver_id} value={d.driver_id}>{d.name} — {d.license_no}</option>
+                    ))}
+                  </select>
+                )
+              )}
+
+              {vehicleDriverMode === 'none' && (
+                <p className="text-sm text-muted-foreground">This vehicle will sit unassigned until a driver is linked from the Drivers or Vehicles tab.</p>
+              )}
+            </div>
+
+            {addVehicleError && <p className="text-xs text-red-600 dark:text-red-400 mb-3">{addVehicleError}</p>}
+
+            <div className="flex gap-3">
+              <button onClick={() => setAddVehicleOpen(false)} className="flex-1 py-2.5 rounded-lg border border-border text-muted-foreground hover:text-foreground hover:border-foreground/20 text-sm transition">
+                Cancel
+              </button>
+              <button
+                onClick={handleAddVehicle}
+                disabled={addVehicleSaving}
+                className="flex-1 py-2.5 rounded-lg bg-primary text-primary-foreground hover:opacity-90 font-semibold text-sm transition disabled:opacity-60"
+              >
+                {addVehicleSaving ? 'Adding…' : 'Add Vehicle'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Reassign Driver Modal */}
+      {reassignVehicle && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm">
+          <div className="w-full max-w-sm rounded-2xl border border-border bg-card p-8 shadow-2xl">
+            <div className="flex items-center justify-between mb-6">
+              <h3 className="text-lg font-bold text-foreground" style={{ fontFamily: 'Rajdhani, sans-serif' }}>Assign Driver</h3>
+              <button onClick={() => setReassignVehicle(null)} className="text-muted-foreground hover:text-foreground transition">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+            <p className="text-sm text-muted-foreground mb-4">
+              Vehicle <span className="text-foreground font-medium font-mono">{reassignVehicle.plate_no}</span>
+            </p>
+            <label className="block text-xs text-muted-foreground mb-1.5 uppercase tracking-wider">Driver</label>
+            <select
+              value={reassignDriverId}
+              onChange={e => setReassignDriverId(e.target.value)}
+              className="w-full px-3 py-2.5 rounded-lg border border-border bg-muted text-foreground text-sm focus:outline-none focus:border-[#14B8A6]/50 transition mb-2"
+            >
+              <option value="">No driver (unassign)</option>
+              {[...unassignedDrivers, ...drivers.filter(d => d.driver_id === reassignVehicle.driver_id)]
+                .sort((a, b) => a.name.localeCompare(b.name))
+                .map(d => (
+                  <option key={d.driver_id} value={d.driver_id}>{d.name} — {d.license_no}</option>
+                ))}
+            </select>
+            <p className="text-xs text-muted-foreground mb-4">
+              Only drivers without a vehicle are listed, alongside this vehicle's current driver.
+            </p>
+            <div className="flex gap-3">
+              <button onClick={() => setReassignVehicle(null)} className="flex-1 py-2.5 rounded-lg border border-border text-muted-foreground text-sm hover:text-foreground hover:border-foreground/20 transition">
+                Cancel
+              </button>
+              <button
+                onClick={handleReassignDriver}
+                disabled={reassignSaving}
+                className="flex-1 py-2.5 rounded-lg bg-primary text-primary-foreground hover:opacity-90 font-semibold text-sm transition disabled:opacity-60"
+              >
+                {reassignSaving ? 'Saving…' : 'Save'}
               </button>
             </div>
           </div>
